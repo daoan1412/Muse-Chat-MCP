@@ -213,26 +213,32 @@ for chunk in r:
 - **Attachments** — send images/video via OpenAI multimodal content (`{"type":"image_url","image_url":{"url":…}}`) or a top-level `files` array (local paths / URLs / data-URIs). Muse sees them like a normal chat attachment.
 - **Plain message** — the shim sends the latest user message **verbatim**: no `### USER/### ASSISTANT` role markers and no "continue the conversation" wrapper. Muse flags roleplay-style wrappers as prompt-injection and refuses them, so the bridge never adds any. Prior context comes from Muse's own thread.
 - **Sessions** — target a chat with header `x-muse-chat: <title|index|url>` (or body `chat`); read chats via `GET /v1/muse/chats` and `GET /v1/muse/chat`.
-- **Headers** — `x-muse-thread: new` (navigate to `/` first), `x-muse-timeout-ms`.
+- **Headers** — `x-muse-thread: new` starts a fresh side chat (over `noise` this creates a real new thread with its own event feed; over `browser` it navigates to `/` first), `x-muse-timeout-ms`.
 
 ---
 
 ## Use the CLI
 
-`muse-cli.mjs` talks to the shim (reusing a running one, or auto-starting `--serve-only` and shutting it down after).
+`muse-cli.mjs` talks to the OpenAI shim — it reuses a running one, or auto-starts `muse-server.mjs --serve-only` and shuts it down after (disable with `MUSE_CLI_AUTOSTART=0`). Prepend `MUSE_TRANSPORT=noise` to run **headless** (no browser).
 
 ```bash
-node muse-cli.mjs "Explain what a B-tree is in 2 sentences."          # streams to stdout
-node muse-cli.mjs --no-stream -s "Output ONLY raw code." "Write ..."   # exact final code
-node muse-cli.mjs -f ./frame.jpg "Write a Facebook caption for this image."  # attach image/video
-node muse-cli.mjs --list-chats                                        # list Muse chats
-node muse-cli.mjs --read "Video creation capability"                  # read a chat
-node muse-cli.mjs --chat "Reply with pong" "hi"                       # send into a chat
-echo "<file>" | node muse-cli.mjs -s "Review this file"                # stdin prompt
-npm run muse -- "hello"                                                # via package.json
+node muse-cli.mjs "Explain what a B-tree is in 2 sentences."                  # stream the reply to stdout
+node muse-cli.mjs --no-stream -s "Output ONLY raw code." "Write a quicksort"   # exact final answer, no streaming
+node muse-cli.mjs --json "hi"                                                 # raw OpenAI JSON instead
+node muse-cli.mjs -f ./frame.jpg "Caption this image for Facebook."           # attach image/video/file (repeat -f)
+node muse-cli.mjs --list-chats                                                # list chats (Main / Channels / Side chats)
+node muse-cli.mjs --list-chats --query "video"                                # filter the chat list by title
+node muse-cli.mjs --read "Video creation capability"                          # read a chat's latest reply
+node muse-cli.mjs --chat "Video creation capability" "Reply with pong"        # send into a specific chat
+node muse-cli.mjs --media --download --dir ./out                              # fetch generated images/video, save to ./out
+node muse-cli.mjs --new-thread "Solve 2x^2 - 5x + 3 = 0"                      # fresh side chat (isolated; parallel-safe over noise)
+echo "<file contents>" | node muse-cli.mjs -s "Review this file"              # prompt from stdin
+npm run muse -- "hello"                                                       # via package.json
 ```
 
-Options: `-s/--system`, `-m/--model`, `-t/--timeout`, `-f/--file <path|url>` (repeatable), `--chat <name|index|url>`, `--list-chats`, `--query <text>`, `--read [<chat>]`, `--media [<chat>]`, `--download`, `--dir <dir>`, `--new-thread`, `--no-stream`, `--json`, `--base` (or env `MUSE_SHIM_URL`).
+Options: `-s/--system <text>`, `-m/--model <id>` (default `muse-spark-1.3`), `-t/--timeout <ms>` (default 180000), `-f/--file/--image <path|url>` (repeatable), `--chat <name|index|url>`, `--list-chats`, `--query <text>`, `--read [<chat>]`, `--media [<chat>]`, `--download`, `--dir <dir>`, `--new-thread`, `--no-stream`, `--json`, `--base <url>` (or env `MUSE_SHIM_URL`), `-h/--help`.
+
+`--new-thread` starts a fresh side chat. Over `noise` this is a real new thread with its own event feed, so many `--new-thread` requests run **in parallel, isolated** (see [Sessions](#sessions-multiple-chats)). Over `browser` it navigates to `/` first (best-effort) and requests are serialized.
 
 ---
 
@@ -329,6 +335,7 @@ opencode, Cursor, Cline, Aider, … anything that can read files.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `MUSE_TRANSPORT` | `browser` | `browser` (drive Chrome) or `noise` (headless, no Chrome — see below) |
 | `MUSE_PROFILE_DIR` | `./.muse-profile` | dedicated Chrome profile (holds your login) |
 | `MUSE_URL` | `https://muse.ai/` | app URL |
 | `MUSE_CHANNEL` | `chrome` | `chrome` or `msedge` |
@@ -345,6 +352,32 @@ opencode, Cursor, Cline, Aider, … anything that can read files.
 
 ---
 
+## Headless noise transport (`MUSE_TRANSPORT=noise`)
+
+Set `MUSE_TRANSPORT=noise` to skip Chrome entirely. The client performs the Noise
+handshake itself (`Noise_XX_25519_AESGCM_SHA256`), speaks the protobuf RPC framing,
+and reads the reply from the `chat.subscribe` event stream — no browser, no DOM.
+
+```bash
+MUSE_TRANSPORT=noise npm run selftest              # connect + status, headless
+MUSE_TRANSPORT=noise node muse-server.mjs          # MCP server over noise
+MUSE_TRANSPORT=noise node muse-cli.mjs "hi"        # CLI over the noise shim
+```
+
+It still needs your login: the cookies are read once from the same `.muse-profile`
+(headless, then closed) and reused for the session, so **log in with the browser
+transport first** (`npm run selftest`), then switch to `noise`.
+
+Over `noise` the core tools work (`muse_status`, `muse_chat`, `muse_read_last`,
+`muse_read_chat`, `muse_list_chats`, `muse_chat_media`, plus the shim
+`/v1/chat/completions` incl. streaming and `/v1/muse/{chats,chat,media}`). Attachments
+upload through `/fs/write` into the workspace and are referenced as
+`![alt](sandbox://workspace/…)`; generated media is read back via `/fs/raw`. Only two
+features stay browser-only and degrade with a clear note: `muse_open_chat` (noise has a
+single active session) and `muse_dump_dom` (no DOM).
+
+---
+
 ## Troubleshooting
 
 - **`loggedIn: false`** → run `muse_login` (or `npm run selftest`) and sign in in the Chrome window.
@@ -355,8 +388,8 @@ opencode, Cursor, Cline, Aider, … anything that can read files.
 
 ## Limitations
 
-- **One conversation.** Muse is a single persistent thread; the in-app "new chat" control is unreliable. The shim sends the full transcript each call; `x-muse-thread: new` navigates to `/` first (best-effort fresh context).
-- **Serialized** — one browser, requests run one at a time (auto-queued).
+- **One conversation (browser).** Over `browser`, Muse drives a single persistent thread; `x-muse-thread: new` navigates to `/` first (best-effort fresh context), and requests are serialized (one at a time, auto-queued).
+- **Parallel side chats (noise).** Over `noise`, `new_thread` / `x-muse-thread: new` / `opts.newSession` creates a real new side chat per request (own `session_id` + event feed), so concurrent requests run in parallel, isolated — no cross-contamination. Turns on the shared active session are still serialized.
 - **Tool calling is prompt-injected** — best-effort, not a native function-calling API.
 - **DOM-driven** — a Muse UI change can break selectors; `muse_dump_dom` is the escape hatch.
 
@@ -364,7 +397,10 @@ opencode, Cursor, Cline, Aider, … anything that can read files.
 
 ## Roadmap
 
-- [ ] **Phase 2 — headless Noise client.** Talk to Muse directly over `wss://hatch.metaaivm.com/v1/noise` (X25519 + HKDF + AES‑GCM + Ed25519) with a `MUSE_TRANSPORT=noise|browser` switch, keeping the browser driver as fallback.
+- [x] **Phase 2 — headless Noise client.** Done: `muse-noise.mjs` talks to Muse directly
+  over `wss://hatch.metaaivm.com/v1/noise` (`Noise_XX_25519_AESGCM_SHA256`), with a
+  `MUSE_TRANSPORT=noise|browser` switch (`muse-transport.mjs`); the browser driver stays
+  as the default fallback.
 - [ ] Native tool-calling passthrough for clients that support it.
 - [ ] Multi-thread support when Muse exposes a reliable switch.
 

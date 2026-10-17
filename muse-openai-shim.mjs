@@ -2,7 +2,7 @@
 /**
  * muse-openai-shim.mjs
  * ------------------------------------------------------------------
- * OpenAI-compatible HTTP shim over the Muse browser driver.
+ * OpenAI-compatible HTTP shim over the Muse browser transport.
  *
  *   GET  /v1/models              -> model list
  *   POST /v1/chat/completions    -> OpenAI chat completions (stream + non-stream)
@@ -25,7 +25,7 @@
  * ------------------------------------------------------------------
  */
 import http from 'node:http'
-import { driver } from './muse-driver.mjs'
+import { transport } from './muse-transport.mjs'
 
 const PORT = Number(process.env.MUSE_SHIM_PORT || 8787)
 const HOST = process.env.MUSE_SHIM_HOST || '127.0.0.1'
@@ -210,7 +210,7 @@ async function handleChat(req, res, body) {
 
       if (wantTools) {
         // Buffer so we can decide tool_calls vs content before emitting.
-        const r = await driver.chat(prompt, { timeoutMs, newThread, files, chat })
+        const r = await transport.chat(prompt, { timeoutMs, newThread, files, chat })
         if (r.error) throw new Error(r.error)
         const calls = parseToolCalls(r.reply)
         if (calls && calls.length) {
@@ -226,7 +226,7 @@ async function handleChat(req, res, body) {
         }
       } else {
         let emitted = ''
-        const r = await driver.chatStream(prompt, {
+        const r = await transport.chatStream(prompt, {
           timeoutMs, newThread, files, chat,
           onDelta: (full) => {
             const next = full.startsWith(emitted) ? full.slice(emitted.length) : full
@@ -250,7 +250,7 @@ async function handleChat(req, res, body) {
     }
 
     // Non-streaming
-    const r = await driver.chat(prompt, { timeoutMs, newThread, files, chat })
+    const r = await transport.chat(prompt, { timeoutMs, newThread, files, chat })
     if (r.error && !r.reply) throw new Error(r.error)
     const calls = wantTools ? parseToolCalls(r.reply) : null
 
@@ -303,7 +303,7 @@ export function startShim({ port = PORT, host = HOST } = {}) {
     try {
       if (req.method === 'GET' && (url === '/health' || url === '/')) {
         let st = { browserRunning: false, loggedIn: false }
-        try { st = await driver.status() } catch {}
+        try { st = await transport.status() } catch {}
         res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
         return res.end(JSON.stringify({ ok: true, ...st, models: MODEL_IDS }))
       }
@@ -319,7 +319,7 @@ export function startShim({ port = PORT, host = HOST } = {}) {
       // Session reading (Muse chats): list chats, or read one chat (optionally opening it first).
       if (req.method === 'GET' && url === '/v1/muse/chats') {
         const params = new URL(req.url, 'http://localhost').searchParams
-        const data = await driver.listChats(params.get('query') || undefined)
+        const data = await transport.listChats(params.get('query') || undefined)
         res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
         return res.end(JSON.stringify(data))
       }
@@ -327,8 +327,8 @@ export function startShim({ port = PORT, host = HOST } = {}) {
       if (req.method === 'GET' && url === '/v1/muse/chat') {
         const params = new URL(req.url, 'http://localhost').searchParams
         const target = params.get('target')
-        if (target) await driver.openChat(/^\d+$/.test(target) ? Number(target) : target)
-        const data = await driver.readChat(Number(params.get('max')) || 100)
+        if (target) await transport.openChat(/^\d+$/.test(target) ? Number(target) : target)
+        const data = await transport.readChat(Number(params.get('max')) || 100)
         res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
         return res.end(JSON.stringify(data))
       }
@@ -337,7 +337,7 @@ export function startShim({ port = PORT, host = HOST } = {}) {
         const params = new URL(req.url, 'http://localhost').searchParams
         const target = params.get('target')
         const download = params.get('download') === '1' || params.get('download') === 'true'
-        const data = await driver.chatMedia(target || undefined, { download, dir: params.get('dir') || undefined })
+        const data = await transport.chatMedia(target || undefined, { download, dir: params.get('dir') || undefined })
         res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
         return res.end(JSON.stringify(data))
       }

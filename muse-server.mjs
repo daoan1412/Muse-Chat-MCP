@@ -16,6 +16,7 @@
  *   muse_close     - close the browser
  *
  * Config (env):
+ *   MUSE_TRANSPORT     noise | browser   (default browser; noise = headless, no Chrome)
  *   MUSE_PROFILE_DIR   dedicated Chrome profile (default: ./.muse-profile)
  *   MUSE_URL           app URL (default https://muse.ai/)
  *   MUSE_HEADLESS=1    run headless (login must be done beforehand)
@@ -25,7 +26,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
-import { driver } from './muse-driver.mjs'
+import { transport } from './muse-transport.mjs'
 import { startShim } from './muse-openai-shim.mjs'
 
 const log = (...a) => console.error('[muse-mcp]', ...a)
@@ -49,7 +50,7 @@ export function buildServer() {
       description: 'Report whether the Muse browser is running, whether you are logged in to muse.ai, and whether the chat composer is ready.',
       inputSchema: {},
     },
-    wrap(async () => driver.status()),
+    wrap(async () => transport.status()),
   )
 
   server.registerTool(
@@ -61,7 +62,7 @@ export function buildServer() {
         timeout_sec: z.number().int().positive().max(900).optional().describe('How long to wait for login (default 300).'),
       },
     },
-    wrap(async ({ timeout_sec }) => driver.login((timeout_sec || 300) * 1000)),
+    wrap(async ({ timeout_sec }) => transport.login((timeout_sec || 300) * 1000)),
   )
 
   server.registerTool(
@@ -71,7 +72,7 @@ export function buildServer() {
       description: 'Start a fresh Muse thread (navigates to the home composer).',
       inputSchema: {},
     },
-    wrap(async () => driver.newChat()),
+    wrap(async () => transport.newChat()),
   )
 
   server.registerTool(
@@ -88,7 +89,7 @@ export function buildServer() {
       },
     },
     wrap(async ({ prompt, timeout_sec, new_thread, files, chat }) =>
-      driver.chat(prompt || '', { timeoutMs: (timeout_sec || 240) * 1000, newThread: !!new_thread, files, chat }),
+      transport.chat(prompt || '', { timeoutMs: (timeout_sec || 240) * 1000, newThread: !!new_thread, files, chat }),
     ),
   )
 
@@ -99,7 +100,7 @@ export function buildServer() {
       description: 'Return the most recent assistant message from the current thread without sending anything.',
       inputSchema: {},
     },
-    wrap(async () => driver.readLast()),
+    wrap(async () => transport.readLast()),
   )
 
   server.registerTool(
@@ -111,7 +112,7 @@ export function buildServer() {
         query: z.string().optional().describe('Optional case-insensitive title filter.'),
       },
     },
-    wrap(async ({ query }) => driver.listChats(query)),
+    wrap(async ({ query }) => transport.listChats(query)),
   )
 
   server.registerTool(
@@ -123,7 +124,7 @@ export function buildServer() {
         target: z.union([z.string(), z.number()]).describe('Chat title (substring), index from muse_chats, a thread URL, or a thread id.'),
       },
     },
-    wrap(async ({ target }) => driver.openChat(target)),
+    wrap(async ({ target }) => transport.openChat(target)),
   )
 
   server.registerTool(
@@ -137,8 +138,8 @@ export function buildServer() {
       },
     },
     wrap(async ({ chat, max }) => {
-      if (chat !== undefined && chat !== null && chat !== '') await driver.openChat(chat)
-      return driver.readChat(max || 100)
+      if (chat !== undefined && chat !== null && chat !== '') await transport.openChat(chat)
+      return transport.readChat(max || 100)
     }),
   )
 
@@ -153,7 +154,7 @@ export function buildServer() {
         dir: z.string().optional().describe('Directory for downloads (default: ./downloads next to the server).'),
       },
     },
-    wrap(async ({ chat, download, dir }) => driver.chatMedia(chat, { download: !!download, dir })),
+    wrap(async ({ chat, download, dir }) => transport.chatMedia(chat, { download: !!download, dir })),
   )
 
   server.registerTool(
@@ -165,7 +166,7 @@ export function buildServer() {
         max_chars: z.number().int().positive().max(200000).optional().describe('Truncate HTML to this many characters (default 20000).'),
       },
     },
-    wrap(async ({ max_chars }) => driver.dumpDom(max_chars || 20000)),
+    wrap(async ({ max_chars }) => transport.dumpDom(max_chars || 20000)),
   )
 
   server.registerTool(
@@ -175,7 +176,7 @@ export function buildServer() {
       description: 'Close the dedicated Chrome window and release the profile.',
       inputSchema: {},
     },
-    wrap(async () => driver.close()),
+    wrap(async () => transport.close()),
   )
 
   return server
@@ -185,17 +186,17 @@ async function main() {
   const args = process.argv.slice(2)
 
   if (args.includes('--self-test')) {
-    await driver.launch()
-    const st = await driver.status()
+    await transport.launch()
+    const st = await transport.status()
     log('self-test status:', JSON.stringify(st))
-    await driver.close()
+    await transport.close()
     process.exit(0)
   }
 
   if (args.includes('--dump-dom')) {
-    const d = await driver.dumpDom(4000)
+    const d = await transport.dumpDom(4000)
     console.error(JSON.stringify({ url: d.url, counts: d.counts, hasApproval: d.hasApproval }, null, 2))
-    await driver.close()
+    await transport.close()
     process.exit(0)
   }
 
@@ -210,13 +211,13 @@ async function main() {
   }
 
   const server = buildServer()
-  const transport = new StdioServerTransport()
-  await server.connect(transport)
+  const mcpTransport = new StdioServerTransport()
+  await server.connect(mcpTransport)
   log('muse MCP server ready on stdio')
   startShimIfEnabled()
 
   const shutdown = async () => {
-    await driver.close().catch(() => {})
+    await transport.close().catch(() => {})
     process.exit(0)
   }
   process.on('SIGINT', shutdown)
