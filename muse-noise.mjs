@@ -326,6 +326,7 @@ export class MuseNoiseClient {
     this.ws = null
     this.transport = null
     this.handlers = new Map() // streamId(string) -> {onFrame, onEnd}
+    this._settled = new Set() // streamIds whose handler already finished (ignore benign tails)
     this._pumping = false
   }
   async rest(method, path, body) {
@@ -433,6 +434,7 @@ export class MuseNoiseClient {
   // Central frame pump: decrypt each wire frame, reassemble chunks, dispatch by stream_id.
   _startPump() {
     this._pumping = true
+    this._settled.clear() // fresh connection → stream ids restart; drop stale settled keys
     ;(async () => {
       while (this._pumping) {
         const raw = await this._recv.next(0)
@@ -443,6 +445,7 @@ export class MuseNoiseClient {
         const key = String(BigInt(frame.stream_id))
         const h = this.handlers.get(key)
         if (h) { try { h.onFrame(frame) } catch (e) { this.log('handler error:', e.message) } }
+        else if (this._settled.has(key)) { /* stream already finished — ignore benign trailing body_chunk/response */ }
         else this.log('unhandled frame stream', key, 'kind', frame.kind && frame.kind.case)
       }
       for (const [, h] of this.handlers) { try { h.onEnd && h.onEnd() } catch {} }
@@ -467,11 +470,16 @@ export class MuseNoiseClient {
     const streamId = this._send(method, path, body, { service, headers })
     const key = String(streamId)
     return new Promise((resolve, reject) => {
+      const EMPTY_BODY_GRACE_MS = Number(process.env.MUSE_EMPTY_BODY_GRACE_MS ?? 1200)
       let status = null, respHeaders = [], settled = false
       const bodyParts = []
+      let grace = null
       const finish = (err) => {
         if (settled) return; settled = true
-        clearTimeout(timer); this.handlers.delete(key)
+        clearTimeout(timer); if (grace) clearTimeout(grace)
+        this.handlers.delete(key)
+        if (this._settled.size > 1000) this._settled.clear()
+        this._settled.add(key)
         if (err) reject(err)
         else resolve({ status, headers: respHeaders, body: Buffer.from(concat(...(bodyParts.length ? bodyParts : [new Uint8Array(0)]))) })
       }
@@ -481,7 +489,13 @@ export class MuseNoiseClient {
           const kind = frame.kind
           if (!kind) return
           if (kind.case === 'reset') { const r = kind.value; finish(new Error(`reset code=${Number(r.code)} reason=${Buffer.from(r.reason || new Uint8Array(0)).toString('utf8')}`)); return }
-          if (kind.case === 'response') { status = Number(kind.value.status); respHeaders = kind.value.headers || []; if (kind.value.body?.length) bodyParts.push(kind.value.body); if (kind.value.end_body) finish() }
+          if (kind.case === 'response') {
+            status = Number(kind.value.status); respHeaders = kind.value.headers || []
+            if (kind.value.body?.length) bodyParts.push(kind.value.body)
+            // Don't resolve on an empty-body `response` if the JSON may still arrive as a
+            // trailing body_chunk — give it a short grace, then finish with what we have.
+            if (kind.value.end_body) { if (bodyParts.length) finish(); else grace = setTimeout(finish, EMPTY_BODY_GRACE_MS) }
+          }
           else if (kind.case === 'body_chunk') { if (kind.value.data?.length) bodyParts.push(kind.value.data); if (kind.value.end_body) { if (status === null) status = 200; finish() } }
         },
         onEnd: () => { if (status === null) finish(new Error('stream closed before response')); else finish() },
@@ -574,7 +588,7 @@ export class MuseNoiseClient {
           if (timeoutMs) setTimeout(() => { if (notify === done) done() }, timeoutMs)
         })
       },
-      stop: () => { this.handlers.delete(key) },
+      stop: () => { this.handlers.delete(key); if (this._settled.size > 1000) this._settled.clear(); this._settled.add(key) },
     }
   }
   // Full turn. newSession=true creates a brand-new side chat (thread): we send
