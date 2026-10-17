@@ -508,7 +508,22 @@ class MuseDriver {
       }
     }
 
-    const before = await p.locator(SELECTORS.assistant).count()
+    // Anchor the turn on message order, not a pre-send assistant count: the
+    // reply is the assistant message AFTER our user message. A continuing chat
+    // (or a home→main-chat fallback when "New side chat" isn't clickable, as in
+    // headless) must never return a stale previous-turn reply, so we wait until
+    // OUR user message is in the DOM before reading the turn.
+    const prevUserCount = await p.locator(SELECTORS.user).count()
+    const readTurn = async () => {
+      const items = await p.locator(SELECTORS.message).evaluateAll((els) =>
+        els.map((e) => ({ role: e.getAttribute('data-message-role') || '', text: (e.innerText || '').trim() })),
+      )
+      let lastUser = -1
+      for (let i = items.length - 1; i >= 0; i--) { if (items[i].role === 'user') { lastUser = i; break } }
+      let txt = ''
+      for (let i = items.length - 1; i > lastUser; i--) { if (items[i].role === 'assistant') { txt = items[i].text; break } }
+      return { items, lastUser, txt }
+    }
 
     // Focus + fill the composer. insertText is O(1) for big prompts;
     // fall back to per-key typing if the editor ignores it.
@@ -551,10 +566,12 @@ class MuseDriver {
     while (Date.now() < deadline) {
       const stop = await p.locator(SELECTORS.stopButton).count()
       if (stop > 0) started = true
-      const n = await p.locator(SELECTORS.assistant).count()
-      if (n > before) {
-        const txt = await p.locator(SELECTORS.assistant).last().innerText().catch(() => '')
-        if (txt !== lastText) {
+      // Only read once OUR message has landed (a new user item appears), so we
+      // anchor on this turn and never grab a previous-turn reply.
+      if (await p.locator(SELECTORS.user).count() > prevUserCount) {
+        const turn = await readTurn()
+        const txt = turn.txt
+        if (txt && txt !== lastText) {
           lastText = txt
           stableSince = Date.now()
         }
@@ -564,7 +581,7 @@ class MuseDriver {
           committed = txt
           try { onDelta(committed) } catch { /* ignore */ }
         }
-        if (stop === 0 && ((started && idle > 1200) || (!started && idle > 2500))) break
+        if (txt && stop === 0 && ((started && idle > 1200) || (!started && idle > 2500))) break
       }
       if (await p.locator(SELECTORS.errorNotice).count()) {
         this.lastError = await p.locator(SELECTORS.errorNotice).first().innerText().catch(() => 'assistant error')
@@ -573,10 +590,8 @@ class MuseDriver {
     }
     if (Date.now() >= deadline) timedOut = true
 
-    const items = await p.locator(SELECTORS.assistant).evaluateAll(
-      (els, start) => els.slice(start).map((e) => (e.innerText || '').trim()).filter(Boolean),
-      before,
-    )
+    const turn = await readTurn()
+    const items = turn.items.slice(turn.lastUser + 1).filter((m) => m.role === 'assistant' && m.text).map((m) => m.text)
     const reply = (items.length ? items[items.length - 1] : lastText).trim()
     const needsApproval = (await p.locator(SELECTORS.approvalStack).count()) > 0
 
