@@ -150,7 +150,20 @@ class NoiseTransport {
       profileDir: PROFILE_DIR, headless: true,
     }
   }
-  async login() {
+  async login(opts = {}) {
+    // Noise has no login UI: it needs auth cookies in the shared profile. If
+    // none are cached yet and unattended credentials are supplied, drive a
+    // one-shot browser sign-in (mailtemp OTP) to seed the profile first.
+    if (!this.cookies) {
+      const email = opts.email || process.env.MUSE_META_EMAIL || ''
+      const hasCreds = !!(opts.metaPassword || opts.mailPassword || opts.apiKey ||
+        process.env.MUSE_META_PASSWORD || process.env.MUSE_MAIL_PASSWORD || process.env.MUSE_MAILTEMP_API_KEY)
+      if (email && hasCreds && opts.auto !== false) {
+        try { await driver.login({ ...opts, email }) }
+        catch (e) { log('noise: browser seed sign-in failed:', e.message) }
+        await driver.close().catch(() => {}) // release the profile lock before grabCookies()
+      }
+    }
     const c = await this.ensure()
     const h = await c.chatHistory(1)
     this.viewerId = (h.json && h.json.result && h.json.result.viewer_id) || null

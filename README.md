@@ -62,6 +62,34 @@ npm run selftest          # launches Chrome, prints login/browser state, then cl
 
 A Chrome window opens to `https://muse.ai`. Sign in with your Meta account. The session is stored in a dedicated profile (`.muse-profile/`, git-ignored) and reused afterwards. When `muse_status` reports `"loggedIn": true`, you're ready.
 
+### Unattended login (mailtemp.vn OTP)
+
+To sign in without typing anything, give `muse_login` a temp-mail address plus a
+password or API key — it fills the Meta form, reads the OTP from mailtemp.vn, and
+completes the "remember this device" step automatically:
+
+```jsonc
+// MCP — unattended sign-in via the mailtemp mailbox-password flow
+{ "name": "muse_login", "arguments": {
+    "email": "you@feedez.cutpro.io.vn",
+    "mail_password": "…mailbox password…",   // site/unlock OTP flow
+    "meta_password": "…Meta password…"        // optional; falls back to mail_password
+} }
+```
+
+```bash
+# or via env, then just call muse_login / npm run selftest with no args
+export MUSE_META_EMAIL="you@feedez.cutpro.io.vn"
+export MUSE_MAIL_PASSWORD="…mailbox password…"   # or MUSE_MAILTEMP_API_KEY for the public API
+export MUSE_META_PASSWORD="…Meta password…"       # optional
+```
+
+`muse_login` prefers the mailtemp **public API** (`x-api-key`, `GET /api/code/{email}`)
+when `mail_api_key` / `MUSE_MAILTEMP_API_KEY` is set, and otherwise uses the
+**mailbox-password** flow (`POST /api/site/unlock` → `GET /api/site/inbox`). Run it
+headed (default) — Meta may show a captcha or an unexpected screen that headless
+can't get past; on failure it falls back to waiting for a manual sign-in.
+
 ---
 
 ## Use it as an MCP server
@@ -106,7 +134,7 @@ Add to `claude_desktop_config.json`:
 | Tool | Arguments | Returns |
 | --- | --- | --- |
 | `muse_status` | – | browser / login / composer state |
-| `muse_login` | `timeout_sec?` | waits for Meta sign-in to complete |
+| `muse_login` | `timeout_sec?`, `email?`, `meta_password?`, `mail_password?`, `mail_api_key?`, `auto?` | unattended Meta sign-in via mailtemp OTP, or waits for manual sign-in |
 | `muse_new_chat` | – | navigates to the home composer |
 | `muse_chat` | `prompt`, `timeout_sec?`, `new_thread?`, `files?`, `chat?` | `{ reply, messages, threadUrl, elapsedMs, … }` |
 | `muse_read_last` | – | latest assistant message (no send) |
@@ -416,6 +444,11 @@ opencode, Cursor, Cline, Aider, … anything that can read files.
 | `MUSE_SHIM_URL` | `http://127.0.0.1:8787/v1` | shim base url used by the CLI |
 | `MUSE_CLI_AUTOSTART=0` | off | disable the CLI auto-starting a shim |
 | `MUSE_SUBSCRIPTION_ACTION_ID` | `4029ac5c…` | RSC action id for `muse_usage` (refresh after a Muse redeploy) |
+| `MUSE_META_EMAIL` | – | temp-mail address for unattended `muse_login` (mailtemp.vn) |
+| `MUSE_META_PASSWORD` | – | Meta account password (falls back to `MUSE_MAIL_PASSWORD`) |
+| `MUSE_MAIL_PASSWORD` | – | mailtemp.vn mailbox password (site/unlock OTP flow) |
+| `MUSE_MAILTEMP_API_KEY` | – | mailtemp.vn public API key (`x-api-key`), preferred for reading OTP |
+| `MUSE_MAILTEMP_URL` | `https://mailtemp.vn` | mailtemp base URL |
 
 ---
 

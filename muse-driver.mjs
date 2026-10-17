@@ -57,6 +57,7 @@ const LAUNCH_TIMEOUT = Number(process.env.MUSE_LAUNCH_TIMEOUT_MS || 60000)
 const STREAM_QUIET_MS = Number(process.env.MUSE_STREAM_QUIET_MS || 600)
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const log = (...a) => console.error('[muse-driver]', ...a)
 
 class MuseDriver {
   constructor() {
@@ -237,13 +238,137 @@ class MuseDriver {
     }
   }
 
-  /** Open the app and, if needed, wait for the user to complete Meta login. */
-  async login(timeoutMs = 300000) {
-    await this.gotoApp()
+  /** Locate a login input by name, then placeholder/aria-label keyword, then type. */
+  async _findInput(p, kind) {
+    const names = { email: ['email'], password: ['password'], code: ['code'] }[kind] || []
+    for (const n of names) {
+      const byName = p.locator(`input[name="${n}"]`)
+      if (await byName.count()) return byName.first()
+    }
+    const kw = {
+      email: ['mobile number or email', 'email', 'phone'],
+      password: ['password'],
+      code: ['code', 'security', 'confirmation'],
+    }[kind] || []
+    for (const word of kw) {
+      const byPh = p.locator(`input[placeholder*="${word}" i], input[aria-label*="${word}" i]`)
+      if (await byPh.count()) return byPh.first()
+    }
+    if (kind === 'password') {
+      const pw = p.locator('input[type="password"]')
+      if (await pw.count()) return pw.first()
+    }
+    return null
+  }
+
+  async _clickButton(p, re) {
+    const btn = p.getByRole('button', { name: re }).first()
+    if (await btn.count()) { await btn.click({ timeout: 5000 }).catch(() => {}); return true }
+    return false
+  }
+
+  /** Classify the current Meta/Muse login screen from the DOM. */
+  async _detectScreen(p) {
+    return p.evaluate(() => {
+      const has = (sel) => !!document.querySelector(sel)
+      const txt = () => document.body.innerText || ''
+      if (has('[data-hatch-composer-root]')) return 'app'
+      if (has('input[aria-label*="code" i]') || /enter your code|resend code|use code/i.test(txt())) return 'code'
+      if (has('input[type="password"]')) return 'password'
+      if (has('input[placeholder*="mobile" i]') || /log in or create an account|create account|sign up/i.test(txt())) return 'email'
+      if (/remember this device|use this device|this was me|save login|not now/i.test(txt())) return 'device'
+      return 'other'
+    }).catch(() => 'other')
+  }
+
+  /**
+   * Unattended Meta sign-in: fill email -> password -> OTP (read from
+   * mailtemp.vn) -> handle the "remember this device" screen, looping until
+   * /api/auth/check reports ok. Returns true on success.
+   */
+  async _autoLogin(p, mt, opts) {
+    const metaPass = opts.metaPassword || opts.mailPassword || ''
+    let seen = new Set()
+    try { seen = new Set((await mt.messages()).map((m) => m.id)) } catch (e) { log('pre-inbox read failed:', e.message) }
+    for (let step = 0; step < 24; step++) {
+      const auth = await this.checkAuth()
+      if (auth.ok) { log('auto-login ok at step', step); return true }
+      const screen = await this._detectScreen(p)
+      log(`auto-login step ${step}: screen=${screen}`)
+      if (screen === 'email') {
+        const el = await this._findInput(p, 'email')
+        if (el) {
+          const val = await el.evaluate((e) => e.value).catch(() => '')
+          if (!val) await el.fill(opts.email)
+          await el.evaluate((e) => { e.dispatchEvent(new Event('input', { bubbles: true })); e.dispatchEvent(new Event('change', { bubbles: true })) }).catch(() => {})
+          await sleep(500)
+          if (!(await this._clickButton(p, /continue|tiếp tục|next|get started|create account|sign up/i))) await el.press('Enter')
+          await sleep(3500); continue
+        }
+      }
+      if (screen === 'password') {
+        const el = await this._findInput(p, 'password')
+        if (el) {
+          await el.fill(metaPass); await sleep(300)
+          if (!(await this._clickButton(p, /continue|next|log in|sign in|submit|tiếp tục|đăng nhập/i))) await el.press('Enter')
+          await sleep(3000); continue
+        }
+      }
+      if (screen === 'code') {
+        const el = await this._findInput(p, 'code')
+        if (el) {
+          const c = await mt.waitForCode(seen, { timeoutMs: Math.max(15000, Math.min(90000, opts.timeoutMs || 90000)) })
+          if (!c) { log('no fresh OTP arrived'); break }
+          log('filling OTP', c.code, '(', c.subject || c.from, ')')
+          await el.fill(c.code); seen.add(c.id)
+          await sleep(400)
+          if (!(await this._clickButton(p, /next|continue|confirm|submit|verify|tiếp tục|xác nhận/i))) await el.press('Enter')
+          await sleep(4000); continue
+        }
+      }
+      if (screen === 'device') {
+        if (await this._clickButton(p, /next|yes|save|this was me|use this device|tiếp tục/i)) { await sleep(2500); continue }
+        if (await this._clickButton(p, /not now/i)) { await sleep(2500); continue }
+      }
+      await sleep(2000)
+    }
+    return (await this.checkAuth()).ok
+  }
+
+  /**
+   * Open muse.ai and sign in. With credentials (email + a password or API key,
+   * or env MUSE_META_EMAIL/...) it signs in unattended via mailtemp.vn OTP;
+   * otherwise it waits for a manual sign-in in the Chrome window. Accepts
+   * either a timeout in ms (legacy) or an options object.
+   */
+  async login(optsOrMs = {}) {
+    const opts = typeof optsOrMs === 'number' ? { timeoutMs: optsOrMs } : (optsOrMs || {})
+    const timeoutMs = opts.timeoutMs || 300000
+    const email = opts.email || process.env.MUSE_META_EMAIL || ''
+    const metaPassword = opts.metaPassword || process.env.MUSE_META_PASSWORD || ''
+    const mailPassword = opts.mailPassword || process.env.MUSE_MAIL_PASSWORD || ''
+    const apiKey = opts.apiKey || process.env.MUSE_MAILTEMP_API_KEY || ''
+    const auto = opts.auto !== false && !!email && !!(metaPassword || mailPassword || apiKey)
+
+    const p = await this.gotoApp()
+    let auth = await this.checkAuth()
+    if (auth.ok) return { loggedIn: true, viewerId: auth.viewerId || null, mode: 'already' }
+
+    if (auto) {
+      const { MailTemp } = await import('./muse-mailtemp.mjs')
+      const mt = new MailTemp({ email, apiKey, mailPassword, log })
+      const ok = await this._autoLogin(p, mt, { ...opts, email, metaPassword, mailPassword, timeoutMs })
+      auth = await this.checkAuth()
+      if (ok && auth.ok) return { loggedIn: true, viewerId: auth.viewerId || null, mode: 'auto' }
+      if (HEADLESS) return { loggedIn: false, mode: 'auto-failed', hint: 'Auto-login did not complete (captcha / unexpected screen?). Re-run headed (unset MUSE_HEADLESS) to finish manually, or check credentials.' }
+      log('auto-login incomplete, falling back to manual sign-in')
+    }
+
+    // Interactive fallback: keep waiting for a manual sign-in until the deadline.
     const deadline = Date.now() + timeoutMs
     while (Date.now() < deadline) {
-      const auth = await this.checkAuth()
-      if (auth.ok) return { loggedIn: true, viewerId: auth.viewerId || null }
+      auth = await this.checkAuth()
+      if (auth.ok) return { loggedIn: true, viewerId: auth.viewerId || null, mode: 'manual' }
       await sleep(2000)
     }
     return { loggedIn: false, hint: 'Complete the Meta sign-in in the opened Chrome window, then call muse_login again or muse_status.' }

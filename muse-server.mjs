@@ -57,12 +57,22 @@ export function buildServer() {
     'muse_login',
     {
       title: 'Muse login',
-      description: 'Open muse.ai in the dedicated Chrome window and wait for Meta sign-in to complete. Use when muse_status reports loggedIn=false.',
+      description: 'Open muse.ai and sign in to Meta. With email + a password or API key it signs in unattended, reading the OTP from mailtemp.vn; without credentials it waits for a manual sign-in in the Chrome window. Use when muse_status reports loggedIn=false.',
       inputSchema: {
         timeout_sec: z.number().int().positive().max(900).optional().describe('How long to wait for login (default 300).'),
+        email: z.string().optional().describe('Temp-mail address used for Meta sign-up/login (enables unattended login). Falls back to env MUSE_META_EMAIL.'),
+        meta_password: z.string().optional().describe('Meta account password. Falls back to env MUSE_META_PASSWORD, then to mail_password.'),
+        mail_password: z.string().optional().describe('mailtemp.vn mailbox password (site/unlock OTP flow). Env MUSE_MAIL_PASSWORD.'),
+        mail_api_key: z.string().optional().describe('mailtemp.vn public API key (x-api-key), preferred over mail_password for reading OTP. Env MUSE_MAILTEMP_API_KEY.'),
+        auto: z.boolean().optional().describe('Set false to force interactive sign-in even when credentials are present.'),
       },
     },
-    wrap(async ({ timeout_sec }) => transport.login((timeout_sec || 300) * 1000)),
+    wrap(async ({ timeout_sec, email, meta_password, mail_password, mail_api_key, auto }) =>
+      transport.login({
+        timeoutMs: (timeout_sec || 300) * 1000,
+        email, metaPassword: meta_password, mailPassword: mail_password, apiKey: mail_api_key, auto,
+      }),
+    ),
   )
 
   server.registerTool(

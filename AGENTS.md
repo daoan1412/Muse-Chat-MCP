@@ -16,7 +16,11 @@ See `README.md` for usage.
 
 - `muse-transport.mjs` — `MUSE_TRANSPORT` switch; facade both backends expose the same
   methods the server/shim call (`status`/`login`/`chat`/`chatStream`/`readLast`/`readChat`/`usage`/`close`).
-- `muse-driver.mjs` — browser driver (selectors, `_run`/`chat`/`chatStream`, `_serial`, `usage`).
+- `muse-driver.mjs` — browser driver (selectors, `_run`/`chat`/`chatStream`, `_serial`, `usage`,
+  `login` = unattended Meta sign-in via `muse-mailtemp.mjs` when creds present, else manual wait).
+- `muse-mailtemp.mjs` — mailtemp.vn client for OTP-based auto-login; public API (`x-api-key`,
+  `GET /api/code/{email}`) preferred, mailbox-password flow (`/api/site/unlock` → `/api/site/inbox`)
+  as fallback. Normalizes messages to `{id, code, from, subject}` and exposes `waitForCode(seen)`.
 - `muse-noise.mjs` — headless Noise_XX client: `Noise_XX_25519_AESGCM_SHA256` handshake,
   protobuf HTTP/2-mux framing, REST bootstrap, `chatHistory`/`chatSubscribe`/`chat`/`usage`.
 - `muse-server.mjs` — MCP stdio server (12 tools incl. `muse_usage`) + shim bootstrap;
