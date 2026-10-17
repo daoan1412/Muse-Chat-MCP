@@ -23,7 +23,7 @@ Plus a tiny **CLI** (`muse-cli.mjs`) for one-shot generation from scripts.
 - **MCP tools** over stdio — drop-in for Claude Desktop / opencode / any MCP host.
 - **OpenAI-compatible HTTP shim** with **real streaming** (SSE), correct `finish_reason`, and `/v1` error objects.
 - **Prompt-injected tool calling** — expose OpenAI `tools` to Muse and get `tool_calls` back.
-- **Attachments** — send images/video with a prompt (MCP `files`, OpenAI `image_url` parts, CLI `-f`).
+- **Attachments** — send one or many images/video/documents with a prompt (MCP `files`, OpenAI `image_url` parts, CLI `-f` repeatable); the `files` order numbers them 1,2,3… for multi-image questions.
 - **Sessions & media** — list/open/read/send in any Muse chat, and pull out the images/videos Muse generates (links + download).
 - **Usage / quota** — read your plan, weekly usage % + reset date, and additional-token balance headlessly (`muse_usage` / `--usage` / `GET /v1/muse/usage`).
 - **Muse Manual** — a living guide to Muse's video/image/content capabilities at [`manual/MUSE_MANUAL.md`](manual/MUSE_MANUAL.md), regenerated with `node manual/interview.mjs`.
@@ -132,6 +132,42 @@ message before sending:
 Muse accepts images, video and documents (the composer's file input has **no** `accept`
 filter). Files are set directly on the hidden composer input — no OS file dialog.
 
+#### Multiple images & numbering
+
+You can attach **several** files at once. They are uploaded in the order given and appended to
+the message as `![alt](sandbox://workspace/user/files/…)` — so **the order of the `files` array
+defines the numbering** (file #1 = "image 1", file #2 = "image 2", …). Reference them by number
+in the prompt and Muse maps each number to the correct image.
+
+```jsonc
+// MCP — order of `files` = image 1, 2, 3 …
+{ "name": "muse_chat", "arguments": {
+    "prompt": "I sent 4 images in order 1,2,3,4. For each, give its background color and the digit printed on it. Then the sum of the digits on image 1 and image 3.",
+    "files": ["./img1.png", "./img2.png", "./img3.png", "./img4.png"] } }
+```
+
+```bash
+# CLI — repeat -f; first -f = image 1, second = image 2, …
+node muse-cli.mjs --no-stream \
+  -f ./img1.png -f ./img2.png -f ./img3.png -f ./img4.png \
+  "4 images in order 1-4. For each: background color + printed digit. Then sum of digits on image 1 and image 3."
+```
+
+```jsonc
+// OpenAI shim — top-level files array (same order rule), or inline image_url parts
+{ "model": "muse-spark-1.3",
+  "files": ["./img1.png", "./img2.png"],
+  "messages": [{ "role": "user", "content": "Image 1 vs image 2 — which is darker?" }] }
+```
+
+Verified (4 images, each a distinct color with a digit printed on it, digit ≠ its order number):
+Muse returned the correct color + digit for every image, mapped the numbering to the right files,
+and computed the cross-image sum from the **printed** digits (not the prompt numbers) — so
+multi-image + numbering + reasoning works on both transports.
+
+> Tip: to make numbering unambiguous, name the files `1.png`, `2.png`, … (the `alt` text becomes
+> the filename) or state the order explicitly in the prompt as above.
+
 ### Sessions (multiple chats)
 
 Muse has a **Main chat** plus **Channels** and **Side chats** (each a `muse.ai/thread/<id>`).
@@ -235,7 +271,7 @@ for chunk in r:
 - **Real streaming** — DOM text is re-emitted as OpenAI deltas. Only text that is a *monotonic extension* and has been stable for `MUSE_STREAM_QUIET_MS` (default 600 ms) is emitted; the remainder is flushed at the end. Each stream ends with exactly one `finish_reason`, then `[DONE]`.
 - **Tools** — prompt-injected. Tool schemas are embedded with a *decision-only* rule ("do not execute"), so Muse returns `{"tool_calls":[{"name","arguments"}]}` instead of trying to actually run the action. Parsed into OpenAI `tool_calls` (`finish_reason: "tool_calls"`). Best-effort, not a native function-calling API.
 - **Structured output** — `response_format` (`{"type":"json_object"}` or `{"type":"json_schema","json_schema":{"schema":…}}`) constrains the reply to schema-valid JSON: the schema is injected into the prompt, the reply is extracted (prose/fences stripped), validated with Ajv, and Muse is re-asked up to `MUSE_SCHEMA_RETRY` (default 2) times. Returns `finish_reason: "stop"` with `content` as the JSON string.
-- **Attachments** — send images/video via OpenAI multimodal content (`{"type":"image_url","image_url":{"url":…}}`) or a top-level `files` array (local paths / URLs / data-URIs). Muse sees them like a normal chat attachment.
+- **Attachments** — send images/video via OpenAI multimodal content (`{"type":"image_url","image_url":{"url":…}}`) or a top-level `files` array (local paths / URLs / data-URIs). Muse sees them like a normal chat attachment; the `files` order numbers them 1,2,3… (see [Multiple images & numbering](#multiple-images--numbering)).
 - **Plain message** — the shim sends the latest user message **verbatim**: no `### USER/### ASSISTANT` role markers and no "continue the conversation" wrapper. Muse flags roleplay-style wrappers as prompt-injection and refuses them, so the bridge never adds any. Prior context comes from Muse's own thread.
 - **Sessions** — target a chat with header `x-muse-chat: <title|index|url>` (or body `chat`); read chats via `GET /v1/muse/chats` and `GET /v1/muse/chat`.
 - **Headers** — `x-muse-thread: new` starts a fresh side chat (over `noise` this creates a real new thread with its own event feed; over `browser` it navigates to `/` first), `x-muse-timeout-ms`.
@@ -251,6 +287,7 @@ node muse-cli.mjs "Explain what a B-tree is in 2 sentences."                  # 
 node muse-cli.mjs --no-stream -s "Output ONLY raw code." "Write a quicksort"   # exact final answer, no streaming
 node muse-cli.mjs --json "hi"                                                 # raw OpenAI JSON instead
 node muse-cli.mjs -f ./frame.jpg "Caption this image for Facebook."           # attach image/video/file (repeat -f)
+node muse-cli.mjs -f ./a.png -f ./b.png -f ./c.png "Compare images 1, 2, 3."  # many files; -f order = image 1,2,3
 node muse-cli.mjs --list-chats                                                # list chats (Main / Channels / Side chats)
 node muse-cli.mjs --list-chats --query "video"                                # filter the chat list by title
 node muse-cli.mjs --read "Video creation capability"                          # read a chat's latest reply
