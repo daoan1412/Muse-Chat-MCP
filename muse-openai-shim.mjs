@@ -40,6 +40,9 @@ const MODEL_IDS = (process.env.MUSE_SHIM_MODELS || 'muse-spark-1.3,muse-spark-1.
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean)
+// Optional shared secret. When set, /v1/* requires `Authorization: Bearer <key>`
+// (or `x-api-key`). Empty (default) = no auth, as before.
+const API_KEY = process.env.MUSE_SHIM_API_KEY || ''
 
 const log = (...a) => console.error('[muse-shim]', ...a)
 const rid = () => `chatcmpl-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
@@ -288,6 +291,24 @@ function sendError(res, status, message, type = 'invalid_request_error', code = 
   res.end(body)
 }
 
+// Accept `Authorization: Bearer <key>` or `x-api-key`; no-op when API_KEY unset.
+function authOk(req) {
+  if (!API_KEY) return true
+  const auth = String(req.headers['authorization'] || '')
+  const bearer = auth.replace(/^Bearer\s+/i, '').trim()
+  const key = bearer || String(req.headers['x-api-key'] || '').trim()
+  return key === API_KEY
+}
+
+// Start an SSE response and return a writer that stops writing once the client
+// disconnects, so a mid-stream failure never throws into a dead socket.
+function beginStream(res) {
+  sseHeaders(res)
+  let closed = false
+  res.on('close', () => { closed = true })
+  return { write: (s) => { if (!closed) { try { res.write(s) } catch { closed = true } } } }
+}
+
 // ---------------------------------------------------------------- handler
 
 async function handleChat(req, res, body) {
@@ -316,6 +337,8 @@ async function handleChat(req, res, body) {
     else if (/^\d+$/.test(s)) chat = Number(s)
   }
 
+  let streamWriter = null
+
   log(`chat model=${model} stream=${stream} tools=${wantTools} files=${files.length} target=${chat !== undefined ? chat : 'current'} promptChars=${prompt.length}`)
 
   try {
@@ -328,10 +351,7 @@ async function handleChat(req, res, body) {
       const out = await runStructured(prompt, rfInfo, validate, { timeoutMs, newThread, files, chat })
       const jsonStr = JSON.stringify(out.obj)
       if (stream) {
-        sseHeaders(res)
-        let closed = false
-        res.on('close', () => { closed = true })
-        const write = (s) => { if (!closed) { try { res.write(s) } catch { closed = true } } }
+        const w = beginStream(res); streamWriter = w; const write = w.write
         write(chunk(id, model, created, { role: 'assistant', content: '' }))
         for (let i = 0; i < jsonStr.length; i += 60) write(chunk(id, model, created, { content: jsonStr.slice(i, i + 60) }))
         write(chunk(id, model, created, {}, 'stop'))
@@ -353,10 +373,7 @@ async function handleChat(req, res, body) {
 
     let finishReason = 'stop'
     if (stream) {
-      sseHeaders(res)
-      let closed = false
-      res.on('close', () => { closed = true })
-      const write = (s) => { if (!closed) { try { res.write(s) } catch { closed = true } } }
+      const w = beginStream(res); streamWriter = w; const write = w.write
       write(chunk(id, model, created, { role: 'assistant', content: '' }))
 
       if (wantTools) {
@@ -423,7 +440,16 @@ async function handleChat(req, res, body) {
     log('error:', err && err.message)
     let msg = `Muse error: ${err && err.message ? err.message : String(err)}`
     if (err && err.detail && Array.isArray(err.detail.errors)) msg += ` (last attempt: ${err.detail.errors.slice(0, 6).join('; ')})`
-    sendError(res, 502, msg, 'api_error')
+    if (streamWriter) {
+      // SSE headers already sent — a JSON error body is impossible. Emit an SSE
+      // `event: error` (OpenAI-style error object) then [DONE] so the client
+      // terminates cleanly instead of hanging on a silently truncated stream.
+      streamWriter.write(`event: error\ndata: ${JSON.stringify({ error: { message: msg, type: 'api_error', param: null, code: null } })}\n\n`)
+      streamWriter.write('data: [DONE]\n\n')
+      try { res.end() } catch {}
+    } else {
+      sendError(res, 502, msg, 'api_error')
+    }
   }
 }
 
@@ -441,7 +467,7 @@ function readBody(req, limit = 8 * 1024 * 1024) {
   })
 }
 
-export function startShim({ port = PORT, host = HOST } = {}) {
+export function startShim({ port = PORT, host = HOST, exitOnError = false } = {}) {
   const server = http.createServer(async (req, res) => {
     const url = (req.url || '').split('?')[0]
     if (req.method === 'OPTIONS') {
@@ -451,6 +477,11 @@ export function startShim({ port = PORT, host = HOST } = {}) {
         'Access-Control-Allow-Headers': '*',
       })
       return res.end()
+    }
+
+    // Optional auth: /v1/* only; /health and / stay open for liveness probes.
+    if ((url === '/v1' || url.startsWith('/v1/')) && !authOk(req)) {
+      return sendError(res, 401, 'Invalid or missing API key (send Authorization: Bearer <MUSE_SHIM_API_KEY>)', 'authentication_error', 'invalid_api_key')
     }
 
     try {
@@ -515,13 +546,19 @@ export function startShim({ port = PORT, host = HOST } = {}) {
     }
   })
 
+  server.on('error', (err) => {
+    // Without this, EADDRINUSE (or any listen failure) emits an unhandled
+    // 'error' event and crashes the whole process.
+    log(`listen error on ${host}:${port}: ${err && err.message}`)
+    if (exitOnError) { console.error(`[muse-shim] cannot start on ${host}:${port}: ${err && err.message}`); process.exit(1) }
+  })
   server.listen(port, host, () => {
-    log(`OpenAI shim listening on http://${host}:${port}/v1  (models: ${MODEL_IDS.join(', ')})`)
+    log(`OpenAI shim listening on http://${host}:${port}/v1  (models: ${MODEL_IDS.join(', ')})${API_KEY ? '  [auth on]' : ''}`)
   })
   return server
 }
 
 const isMain = process.argv[1] && import.meta.url === new URL(`file://${process.argv[1].replace(/\\/g, '/')}`).href
 if (isMain || process.argv.includes('--standalone')) {
-  startShim()
+  startShim({ exitOnError: true })
 }

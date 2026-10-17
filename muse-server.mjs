@@ -223,10 +223,31 @@ async function main() {
   // Optional OpenAI-compatible HTTP shim, sharing this same driver/browser.
   // Default port 8787; disable with MUSE_SHIM_PORT=0.
   const shimPort = process.env.MUSE_SHIM_PORT === undefined ? 8787 : Number(process.env.MUSE_SHIM_PORT)
-  const startShimIfEnabled = () => { if (shimPort > 0) startShim({ port: shimPort }) }
+  let httpServer = null
+  const startShimIfEnabled = ({ exitOnError = false } = {}) => {
+    if (shimPort > 0) httpServer = startShim({ port: shimPort, exitOnError })
+  }
+
+  // Graceful shutdown for BOTH modes: stop accepting HTTP, give in-flight a
+  // moment, force-close lingering sockets, then release the browser/profile.
+  // Without this, SIGTERM in --serve-only is an abrupt default-kill that
+  // orphans Chrome and can leave the profile locked for the next run.
+  let shuttingDown = false
+  const shutdown = async () => {
+    if (shuttingDown) return
+    shuttingDown = true
+    if (httpServer) {
+      try { httpServer.close() } catch {}
+      setTimeout(() => { try { httpServer.closeAllConnections?.() } catch {} }, 2000).unref()
+    }
+    await transport.close().catch(() => {})
+    process.exit(0)
+  }
+  process.on('SIGINT', shutdown)
+  process.on('SIGTERM', shutdown)
 
   if (args.includes('--serve-only')) {
-    startShimIfEnabled()
+    startShimIfEnabled({ exitOnError: true })
     return // keep the process alive on the HTTP listener only
   }
 
@@ -235,14 +256,7 @@ async function main() {
   await server.connect(mcpTransport)
   log('muse MCP server ready on stdio')
   startShimIfEnabled()
-
-  const shutdown = async () => {
-    await transport.close().catch(() => {})
-    process.exit(0)
-  }
-  process.on('SIGINT', shutdown)
-  process.on('SIGTERM', shutdown)
-  process.stdin.on('close', shutdown)
+  process.stdin.on('close', shutdown) // MCP mode only: --serve-only has no stdio consumer
 }
 
 main().catch((err) => {

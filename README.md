@@ -441,6 +441,7 @@ opencode, Cursor, Cline, Aider, … anything that can read files.
 | `MUSE_SHIM_HOST` | `127.0.0.1` | shim bind host |
 | `MUSE_SHIM_TIMEOUT_MS` | `240000` | default shim request timeout |
 | `MUSE_SHIM_MODELS` | `muse-spark-1.3,muse-spark-1.3-contributor,muse` | advertised model ids |
+| `MUSE_SHIM_API_KEY` | – | when set, `/v1/*` requires `Authorization: Bearer <key>` (or `x-api-key`); `/health` stays open |
 | `MUSE_SHIM_URL` | `http://127.0.0.1:8787/v1` | shim base url used by the CLI |
 | `MUSE_CLI_AUTOSTART=0` | off | disable the CLI auto-starting a shim |
 | `MUSE_SUBSCRIPTION_ACTION_ID` | `4029ac5c…` | RSC action id for `muse_usage` (refresh after a Muse redeploy) |
