@@ -325,6 +325,7 @@ async function handleChat(req, res, body) {
   // Default: continue the current Muse thread and rely on the full transcript we send.
   // Send header `x-muse-thread: new` to start a fresh thread instead.
   const newThread = req.headers['x-muse-thread'] === 'new'
+  const account = req.headers['x-muse-account'] || body.account || undefined
   const prompt = buildPrompt(body)
   const wantTools = Array.isArray(body.tools) && body.tools.length > 0 && body.tool_choice !== 'none'
   const stream = body.stream === true
@@ -339,7 +340,7 @@ async function handleChat(req, res, body) {
 
   let streamWriter = null
 
-  log(`chat model=${model} stream=${stream} tools=${wantTools} files=${files.length} target=${chat !== undefined ? chat : 'current'} promptChars=${prompt.length}`)
+  log(`chat model=${model} stream=${stream} tools=${wantTools} files=${files.length} target=${chat !== undefined ? chat : 'current'} account=${account || 'auto'} promptChars=${prompt.length}`)
 
   try {
     if (rfInfo) {
@@ -348,7 +349,7 @@ async function handleChat(req, res, body) {
         try { validate = compileValidator(rfInfo.schema) }
         catch (e) { return sendError(res, 400, `Invalid JSON Schema: ${e.message}`, 'invalid_request_error', null, 'response_format') }
       }
-      const out = await runStructured(prompt, rfInfo, validate, { timeoutMs, newThread, files, chat })
+      const out = await runStructured(prompt, rfInfo, validate, { timeoutMs, newThread, files, chat, account })
       const jsonStr = JSON.stringify(out.obj)
       if (stream) {
         const w = beginStream(res); streamWriter = w; const write = w.write
@@ -378,7 +379,7 @@ async function handleChat(req, res, body) {
 
       if (wantTools) {
         // Buffer so we can decide tool_calls vs content before emitting.
-        const r = await transport.chat(prompt, { timeoutMs, newThread, files, chat })
+        const r = await transport.chat(prompt, { timeoutMs, newThread, files, chat, account })
         if (r.error) throw new Error(r.error)
         const calls = parseToolCalls(r.reply)
         if (calls && calls.length) {
@@ -395,7 +396,7 @@ async function handleChat(req, res, body) {
       } else {
         let emitted = ''
         const r = await transport.chatStream(prompt, {
-          timeoutMs, newThread, files, chat,
+          timeoutMs, newThread, files, chat, account,
           onDelta: (full) => {
             const next = full.startsWith(emitted) ? full.slice(emitted.length) : full
             emitted = full
@@ -418,7 +419,7 @@ async function handleChat(req, res, body) {
     }
 
     // Non-streaming
-    const r = await transport.chat(prompt, { timeoutMs, newThread, files, chat })
+    const r = await transport.chat(prompt, { timeoutMs, newThread, files, chat, account })
     if (r.error && !r.reply) throw new Error(r.error)
     const calls = wantTools ? parseToolCalls(r.reply) : null
 
@@ -429,6 +430,7 @@ async function handleChat(req, res, body) {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
     res.end(JSON.stringify({
       id, object: 'chat.completion', created, model,
+      ...(r.account ? { account: r.account } : {}),
       choices: [{ index: 0, message, finish_reason: calls && calls.length ? 'tool_calls' : 'stop' }],
       usage: {
         prompt_tokens: approxTokens(prompt),
@@ -503,7 +505,7 @@ export function startShim({ port = PORT, host = HOST, exitOnError = false } = {}
       // Session reading (Muse chats): list chats, or read one chat (optionally opening it first).
       if (req.method === 'GET' && url === '/v1/muse/chats') {
         const params = new URL(req.url, 'http://localhost').searchParams
-        const data = await transport.listChats(params.get('query') || undefined)
+        const data = await transport.listChats(params.get('query') || undefined, { account: params.get('account') || undefined })
         res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
         return res.end(JSON.stringify(data))
       }
@@ -511,8 +513,9 @@ export function startShim({ port = PORT, host = HOST, exitOnError = false } = {}
       if (req.method === 'GET' && url === '/v1/muse/chat') {
         const params = new URL(req.url, 'http://localhost').searchParams
         const target = params.get('target')
-        if (target) await transport.openChat(/^\d+$/.test(target) ? Number(target) : target)
-        const data = await transport.readChat(Number(params.get('max')) || 100)
+        const acct = params.get('account') || undefined
+        if (target) await transport.openChat(/^\d+$/.test(target) ? Number(target) : target, { account: acct })
+        const data = await transport.readChat(Number(params.get('max')) || 100, { account: acct })
         res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
         return res.end(JSON.stringify(data))
       }
@@ -521,13 +524,14 @@ export function startShim({ port = PORT, host = HOST, exitOnError = false } = {}
         const params = new URL(req.url, 'http://localhost').searchParams
         const target = params.get('target')
         const download = params.get('download') === '1' || params.get('download') === 'true'
-        const data = await transport.chatMedia(target || undefined, { download, dir: params.get('dir') || undefined })
+        const data = await transport.chatMedia(target || undefined, { download, dir: params.get('dir') || undefined, account: params.get('account') || undefined })
         res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
         return res.end(JSON.stringify(data))
       }
 
       if (req.method === 'GET' && url === '/v1/muse/usage') {
-        const data = await transport.usage()
+        const params = new URL(req.url, 'http://localhost').searchParams
+        const data = await transport.usage({ account: params.get('account') || undefined })
         res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
         return res.end(JSON.stringify(data))
       }

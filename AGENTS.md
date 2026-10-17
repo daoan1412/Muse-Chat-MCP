@@ -15,7 +15,10 @@ See `README.md` for usage.
 ## Map
 
 - `muse-transport.mjs` — `MUSE_TRANSPORT` switch; facade both backends expose the same
-  methods the server/shim call (`status`/`login`/`chat`/`chatStream`/`readLast`/`readChat`/`usage`/`close`).
+  methods the server/shim call (`status`/`login`/`chat`/`chatStream`/`readLast`/`readChat`/`usage`/`close`),
+  each taking an optional trailing `opts`/`opts.account` (browser ignores it). `NoiseTransport` is an
+  account pool (`MUSE_ACCOUNTS` = bare ids → `./accounts/<id>`, or `id=path`; base `MUSE_ACCOUNTS_DIR`):
+  one `MuseNoiseClient` per account, `grabCookies(profileDir)`.
 - `muse-driver.mjs` — browser driver (selectors, `_run`/`chat`/`chatStream`, `_serial`, `usage`,
   `login` = unattended Meta sign-in via `muse-mailtemp.mjs` when creds present, else manual wait).
 - `muse-mailtemp.mjs` — mailtemp.vn client for OTP-based auto-login; public API (`x-api-key`,
@@ -39,6 +42,13 @@ See `README.md` for usage.
 
 - CDP-attached sessions **disconnect only** on close — never kill the user's browser.
 - All browser work is serialized through `driver._serial`.
+- Multi-account is **noise-only**: `MUSE_ACCOUNTS` pools one client per account (own connection +
+  quota); route via `x-muse-account`/`account`/`?account=` (default = first); serialize **per account**
+  (`NoiseTransport._serial(a, …)`), different accounts run in parallel. Browser stays single-account.
+- Load balancing (noise): requests that do NOT name an account are spread by `MUSE_ACCOUNT_LB`
+  (`round_robin` default when >1 | `least_conn` | `first`/`none`); an explicit `x-muse-account`/`account`
+  always pins its account, and a failed candidate fails over to the next (`_turnWithFailover`). Reads
+  (`list_chats`/`usage`/…) stay pinned to the default for determinism — LB applies to `chat`/`chatStream`.
 - Streaming emits only **monotonic, stability-quieted** text; exactly one `finish_reason`.
 - Tool calling is **decision-only** (Muse must not actually execute the tool).
 - Prompts are sent **verbatim** — never add `### USER/### ASSISTANT` roleplay markers or a
@@ -54,7 +64,7 @@ See `README.md` for usage.
   build-specific hash — refresh it with `tools/capture-subaction.mjs` (or set `MUSE_SUBSCRIPTION_ACTION_ID`)
   after a Muse redeploy.
 - Attachments go on the hidden composer `input[type="file"]` via `setInputFiles`.
-- **Never** commit secrets: no `.muse-profile/`, no `*.har`, no tokens.
+- **Never** commit secrets: no `accounts/` (Chrome/Muse profiles), no `*.har`, no tokens.
 
 ### Noise-transport specifics (hard-won, do not regress)
 

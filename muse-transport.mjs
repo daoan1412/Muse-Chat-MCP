@@ -19,21 +19,21 @@
 import path from 'node:path'
 import { promises as fsp } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { driver } from './muse-driver.mjs'
+import { driver, MuseDriver } from './muse-driver.mjs'
 import { MuseNoiseClient } from './muse-noise.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const PROFILE_DIR = process.env.MUSE_PROFILE_DIR || path.join(__dirname, '.muse-profile')
+const PROFILE_DIR = process.env.MUSE_PROFILE_DIR || path.join(__dirname, 'accounts', 'acc1')
 const APP_URL = process.env.MUSE_URL || 'https://muse.ai/'
 const CHANNEL = process.env.MUSE_CHANNEL || 'chrome'
 const TRANSPORT = (process.env.MUSE_TRANSPORT || 'browser').toLowerCase()
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const log = (...a) => console.error('[muse-transport]', ...a)
 
-// Read login cookies from the persistent profile without keeping a browser open.
-async function grabCookies() {
+// Read login cookies from a persistent profile without keeping a browser open.
+async function grabCookies(profileDir = PROFILE_DIR) {
   const { chromium } = await import('playwright-core')
-  const ctx = await chromium.launchPersistentContext(PROFILE_DIR, {
+  const ctx = await chromium.launchPersistentContext(profileDir, {
     channel: CHANNEL, headless: true, viewport: { width: 1366, height: 900 },
     args: ['--no-sandbox', '--disable-gpu', '--disable-blink-features=AutomationControlled'],
   })
@@ -118,74 +118,107 @@ function extractMedia(events) {
 }
 
 class NoiseTransport {
-  constructor() { this.client = null; this.cookies = null; this.viewerId = null; this._connecting = null; this._q = Promise.resolve() }
-  async ensure() {
-    if (this.client && this.client.ws && this.client.ws.readyState === 1) return this.client
-    if (this.client) { try { this.client.close() } catch {}; this.client = null } // stale/closed -> drop it
-    if (this._connecting) return this._connecting // dedupe concurrent callers (one cookie-grab / connect)
-    this._connecting = (async () => {
+  constructor() {
+    this.accounts = new Map() // id -> { id, profileDir, cookies, client, viewerId, connecting, q, inflight }
+    this.order = []
+    this._rr = 0 // round-robin cursor for load balancing
+    const base = path.resolve(__dirname, process.env.MUSE_ACCOUNTS_DIR || 'accounts')
+    const entries = (process.env.MUSE_ACCOUNTS || '').split(',').map((s) => s.trim()).filter(Boolean)
+    if (entries.length) {
+      entries.forEach((e, i) => {
+        const eq = e.indexOf('=')
+        let id, dir
+        if (eq > 0) { id = e.slice(0, eq).trim(); dir = path.resolve(__dirname, e.slice(eq + 1).trim()) }
+        else { id = e; dir = path.join(base, e) } // bare id -> <MUSE_ACCOUNTS_DIR>/<id> (default ./accounts)
+        this._add(id || `acc${i + 1}`, dir)
+      })
+    } else {
+      this._add('default', PROFILE_DIR)
+    }
+    this.defaultId = this.order[0]
+  }
+  _add(id, profileDir) {
+    if (this.accounts.has(id)) return
+    this.accounts.set(id, { id, profileDir, cookies: null, client: null, viewerId: null, connecting: null, inflight: 0, q: Promise.resolve() })
+    this.order.push(id)
+  }
+  _acct(id) {
+    id = id || this.defaultId
+    const a = this.accounts.get(id)
+    if (!a) throw new Error(`unknown account "${id}" (known: ${this.order.join(', ')})`)
+    return a
+  }
+  async _ensure(a) {
+    if (a.client && a.client.ws && a.client.ws.readyState === 1) return a.client
+    if (a.client) { try { a.client.close() } catch {}; a.client = null } // stale/closed -> drop it
+    if (a.connecting) return a.connecting // dedupe concurrent callers (one cookie-grab / connect)
+    a.connecting = (async () => {
       try {
-        if (!this.cookies) this.cookies = await grabCookies()
-        const c = new MuseNoiseClient({ cookies: this.cookies, log })
+        if (!a.cookies) a.cookies = await grabCookies(a.profileDir)
+        const c = new MuseNoiseClient({ cookies: a.cookies, log })
         await c.connect()
-        this.client = c
+        a.client = c
         return c
       } finally {
-        this._connecting = null
+        a.connecting = null
       }
     })()
-    return this._connecting
+    return a.connecting
   }
-  async _reconnect() {
-    try { this.client?.close() } catch {}
-    this.client = null; this.cookies = null
-    return this.ensure()
+  async _reconnect(a) {
+    try { a.client?.close() } catch {}
+    a.client = null; a.cookies = null
+    return this._ensure(a)
   }
-  async launch() { await this.ensure(); return { ok: true, transport: 'noise' } }
-  async status() {
-    const connected = !!(this.client && this.client.ws && this.client.ws.readyState === 1)
+  // Serialize chat turns PER ACCOUNT: noise has one active session per account and
+  // every turn subscribes to the same feed, so concurrent chats on the same account
+  // cross-contaminate. Different accounts run in parallel (separate connections).
+  _serial(a, fn) {
+    const run = a.q.then(() => fn())
+    a.q = run.then(() => {}, () => {}) // keep the chain alive on rejection
+    return run
+  }
+  async launch(opts = {}) { await this._ensure(this._acct(opts.account)); return { ok: true, transport: 'noise', accounts: this.order, defaultAccount: this.defaultId } }
+  async status(opts = {}) {
+    const a = this._acct(opts.account)
+      const accounts = this.order.map((id) => { const x = this.accounts.get(id); return { id: x.id, profileDir: x.profileDir, loggedIn: !!x.cookies, connected: !!(x.client && x.client.ws && x.client.ws.readyState === 1), inflight: x.inflight || 0, viewerId: x.viewerId } })
+    const connected = !!(a.client && a.client.ws && a.client.ws.readyState === 1)
     return {
       browserRunning: false, url: APP_URL, transport: 'noise',
-      loggedIn: !!this.cookies, connected, viewerId: this.viewerId,
-      profileDir: PROFILE_DIR, headless: true,
+      account: a.id, defaultAccount: this.defaultId,
+      loggedIn: !!a.cookies, connected, viewerId: a.viewerId,
+      profileDir: a.profileDir, headless: true, accounts,
     }
   }
   async login(opts = {}) {
-    // Noise has no login UI: it needs auth cookies in the shared profile. If
+    // Noise has no login UI: it needs auth cookies in the account's profile. If
     // none are cached yet and unattended credentials are supplied, drive a
-    // one-shot browser sign-in (mailtemp OTP) to seed the profile first.
-    if (!this.cookies) {
+    // one-shot browser sign-in (mailtemp OTP) into that profile to seed it.
+    const a = this._acct(opts.account)
+    if (!a.cookies) {
       const email = opts.email || process.env.MUSE_META_EMAIL || ''
       const hasCreds = !!(opts.metaPassword || opts.mailPassword || opts.apiKey ||
         process.env.MUSE_META_PASSWORD || process.env.MUSE_MAIL_PASSWORD || process.env.MUSE_MAILTEMP_API_KEY)
       if (email && hasCreds && opts.auto !== false) {
-        try { await driver.login({ ...opts, email }) }
+        const d = new MuseDriver(a.profileDir)
+        try { await d.login({ ...opts, email }) }
         catch (e) { log('noise: browser seed sign-in failed:', e.message) }
-        await driver.close().catch(() => {}) // release the profile lock before grabCookies()
+        await d.close().catch(() => {}) // release the profile lock before grabCookies()
       }
     }
-    const c = await this.ensure()
+    const c = await this._ensure(a)
     const h = await c.chatHistory(1)
-    this.viewerId = (h.json && h.json.result && h.json.result.viewer_id) || null
-    return { loggedIn: h.status === 200, transport: 'noise', viewerId: this.viewerId }
+    a.viewerId = (h.json && h.json.result && h.json.result.viewer_id) || null
+    return { account: a.id, loggedIn: h.status === 200, transport: 'noise', viewerId: a.viewerId }
   }
-  async newChat() { return { ok: true, transport: 'noise', note: 'over noise a new side chat is created per request via new_thread/newSession (the thread materializes on first send)' } }
-  // Serialize chat turns: noise has a single active session and every turn
-  // subscribes to the same event feed, so concurrent chats cross-contaminate
-  // (each sees the other's deltas and breaks on the wrong message_done). Reads
-  // (list/media/history) use independent stream_ids and stay parallel.
-  _serial(fn) {
-    const run = this._q.then(() => fn())
-    this._q = run.then(() => {}, () => {}) // keep the chain alive on rejection
-    return run
-  }
-  async _run(prompt, opts = {}) {
+  async newChat(opts = {}) { const a = this._acct(opts.account); return { ok: true, transport: 'noise', account: a.id, note: 'over noise a new side chat is created per request via new_thread/newSession (the thread materializes on first send)' } }
+  async _run(a, prompt, opts = {}) {
     const t0 = Date.now()
     const onDelta = opts.onDelta
     const refs = opts.files || []
     const attachments = []
     for (let attempt = 0; attempt < 2; attempt++) {
-      const client = await this.ensure()
+      const client = await this._ensure(a)
       try {
         if (!attachments.length) {
           for (const ref of refs) {
@@ -216,6 +249,7 @@ class NoiseTransport {
           threadUrl: APP_URL,
           elapsedMs: Date.now() - t0,
           transport: 'noise',
+          account: a.id,
           ...(r.sessionId ? { sessionId: r.sessionId } : {}),
           ...(attachments.length ? { attachments } : {}),
           ...(r.replyReady ? {} : { timedOut: true }),
@@ -223,32 +257,73 @@ class NoiseTransport {
       } catch (e) {
         if (e.noRetry) throw e // Muse itself reported an error: return it to the caller as-is
         log('chat attempt', attempt, 'failed:', e.message)
-        try { this.client?.close() } catch {}
-        this.client = null // keep cookies; force a fresh connection on retry
+        try { a.client?.close() } catch {}
+        a.client = null // keep cookies; force a fresh connection on retry
         if (attempt === 1) throw e
       }
     }
   }
+  // Assign a turn to an account, tracking in-flight so least_conn can balance.
+  // New-session turns run in parallel (own feed); shared-session turns serialize
+  // per account to avoid cross-contamination.
+  _turn(a, prompt, opts = {}) {
+    a.inflight = (a.inflight || 0) + 1
+    const settle = (r) => { a.inflight = Math.max(0, (a.inflight || 0) - 1); return r }
+    const fail = (e) => { a.inflight = Math.max(0, (a.inflight || 0) - 1); throw e }
+    const p = (opts.newSession || opts.newThread) ? this._run(a, prompt, opts) : this._serial(a, () => this._run(a, prompt, opts))
+    return p.then(settle, fail)
+  }
+  // Ordered candidate accounts for a request that did NOT name one.
+  // MUSE_ACCOUNT_LB: round_robin (default when >1 account) | least_conn | first|none (pin default).
+  _lbCandidates(opts = {}) {
+    const n = this.order.length
+    if (n <= 1) return [this._acct()]
+    const mode = (process.env.MUSE_ACCOUNT_LB || 'round_robin').toLowerCase()
+    if (mode === 'first' || mode === 'none') return [this._acct()]
+    const list = this.order.map((id) => this.accounts.get(id))
+    if (mode === 'least_conn') return [...list].sort((a, b) => (a.inflight || 0) - (b.inflight || 0))
+    const start = ((this._rr++ % n) + n) % n
+    return Array.from({ length: n }, (_, i) => list[(start + i) % n])
+  }
+  // Try candidate accounts in LB order; on a connection/serve failure, fail over
+  // to the next so one dead or rate-limited account doesn't sink the request.
+  async _turnWithFailover(cands, prompt, opts = {}) {
+    let last
+    for (const a of cands) {
+      try { return await this._turn(a, prompt, opts) }
+      catch (e) { last = e; log('LB failover from', a.id, ':', e && e.message) }
+    }
+    throw last
+  }
   // A new-session turn gets its own thread + event feed, so concurrent ones are
   // isolated and can run in parallel (no serialization). Turns on the shared
   // active session must be serialized to avoid cross-contamination.
-  async chat(prompt, opts = {}) { return (opts.newSession || opts.newThread) ? this._run(prompt, opts) : this._serial(() => this._run(prompt, opts)) }
-  async chatStream(prompt, opts = {}) { return (opts.newSession || opts.newThread) ? this._run(prompt, opts) : this._serial(() => this._run(prompt, opts)) }
-  async readLast() {
-    const h = await (await this.ensure()).chatHistory(50)
+  async chat(prompt, opts = {}) {
+    if (opts.account) return this._turn(this._acct(opts.account), prompt, opts)
+    return this._turnWithFailover(this._lbCandidates(opts), prompt, opts)
+  }
+  async chatStream(prompt, opts = {}) {
+    if (opts.account) return this._turn(this._acct(opts.account), prompt, opts)
+    return this._turnWithFailover(this._lbCandidates(opts), prompt, opts)
+  }
+  async readLast(opts = {}) {
+    const a = this._acct(opts.account)
+    const h = await (await this._ensure(a)).chatHistory(50)
     const msgs = historyMessages(h.json)
     const last = [...msgs].reverse().find((m) => m.role === 'assistant')
-    return { reply: last ? last.text : '', messages: msgs.map((m) => m.text), threadUrl: APP_URL }
+    return { reply: last ? last.text : '', messages: msgs.map((m) => m.text), threadUrl: APP_URL, account: a.id }
   }
-  async readChat(max = 100) {
-    const h = await (await this.ensure()).chatHistory(max)
+  async readChat(max = 100, opts = {}) {
+    const a = this._acct(opts.account)
+    const h = await (await this._ensure(a)).chatHistory(max)
     const evs = (h.json && h.json.result && h.json.result.chat_events) || []
     const msgs = historyMessages(h.json)
     const media = extractMedia(evs)
-    return { messages: msgs.map((m) => m.text), entries: msgs.length, media, transport: 'noise' }
+    return { messages: msgs.map((m) => m.text), entries: msgs.length, media, transport: 'noise', account: a.id }
   }
-  async listChats(query) {
-    const s = await (await this.ensure()).listSessions()
+  async listChats(query, opts = {}) {
+    const a = this._acct(opts.account)
+    const s = await (await this._ensure(a)).listSessions()
     const sessions = (s.json && s.json.result && s.json.result.sessions) || []
     let chats = sessions.map((c) => ({
       title: c.title || c.snippet || '(untitled)',
@@ -260,17 +335,18 @@ class NoiseTransport {
       updated_at_ms: c.updated_at_ms,
     }))
     if (query) { const q = String(query).toLowerCase(); chats = chats.filter((c) => c.title.toLowerCase().includes(q) || c.snippet.toLowerCase().includes(q)) }
-    return { chats, threadUrl: APP_URL, transport: 'noise' }
+    return { chats, threadUrl: APP_URL, transport: 'noise', account: a.id }
   }
-  async openChat(target) { return { ok: false, note: 'open_chat is not supported over the noise transport (single active session)', transport: 'noise' } }
-  async chatMedia(chat, { download = false, dir } = {}) {
-    const client = await this.ensure()
+  async openChat(target, opts = {}) { return { ok: false, note: 'open_chat is not supported over the noise transport (single active session)', transport: 'noise' } }
+  async chatMedia(chat, { download = false, dir, account } = {}) {
+    const a = this._acct(account)
+    const client = await this._ensure(a)
     const h = await client.chatHistory(100)
     const evs = (h.json && h.json.result && h.json.result.chat_events) || []
     const media = extractMedia(evs)
     const items = media.map((m, index) => ({ index, role: '', text: m.label, urls: [m.uri] }))
     const urls = media.map((m) => m.uri)
-    const result = { items, urls, count: urls.length, threadUrl: APP_URL, transport: 'noise' }
+    const result = { items, urls, count: urls.length, threadUrl: APP_URL, transport: 'noise', account: a.id }
     if (download && media.length) {
       const outDir = dir || path.join(__dirname, 'downloads')
       await fsp.mkdir(outDir, { recursive: true })
@@ -290,16 +366,17 @@ class NoiseTransport {
     return result
   }
   // Usage needs only the login cookies (plain HTTPS RSC action), not the noise WS.
-  async usage() {
-    let c = this.client
+  async usage(opts = {}) {
+    const a = this._acct(opts.account)
+    let c = a.client
     if (!c) {
-      if (!this.cookies) this.cookies = await grabCookies()
-      c = new MuseNoiseClient({ cookies: this.cookies, log })
+      if (!a.cookies) a.cookies = await grabCookies(a.profileDir)
+      c = new MuseNoiseClient({ cookies: a.cookies, log })
     }
-    return { ...(await c.usage()), transport: 'noise' }
+    return { ...(await c.usage()), account: a.id, transport: 'noise' }
   }
-  async dumpDom() { return { note: 'dump_dom is a browser-only diagnostic (noise transport has no DOM)', transport: 'noise' } }
-  async close() { try { this.client?.close() } catch {} this.client = null }
+  async dumpDom(max, opts = {}) { return { note: 'dump_dom is a browser-only diagnostic (noise transport has no DOM)', transport: 'noise' } }
+  async close(opts = {}) { for (const a of this.accounts.values()) { try { a.client?.close() } catch {} a.client = null } }
 }
 
 export const transport = TRANSPORT === 'noise' ? new NoiseTransport() : driver

@@ -60,7 +60,7 @@ npm install
 npm run selftest          # launches Chrome, prints login/browser state, then closes
 ```
 
-A Chrome window opens to `https://muse.ai`. Sign in with your Meta account. The session is stored in a dedicated profile (`.muse-profile/`, git-ignored) and reused afterwards. When `muse_status` reports `"loggedIn": true`, you're ready.
+A Chrome window opens to `https://muse.ai`. Sign in with your Meta account. The session is stored in a dedicated profile (`accounts/acc1/`, git-ignored) and reused afterwards. When `muse_status` reports `"loggedIn": true`, you're ready.
 
 ### Unattended login (mailtemp.vn OTP)
 
@@ -123,7 +123,7 @@ Add to `claude_desktop_config.json`:
     "muse": {
       "command": "node",
       "args": ["/absolute/path/to/Muse-Chat-MCP/muse-server.mjs"],
-      "env": { "MUSE_PROFILE_DIR": "/absolute/path/to/Muse-Chat-MCP/.muse-profile" }
+      "env": { "MUSE_PROFILE_DIR": "/absolute/path/to/Muse-Chat-MCP/accounts/acc1" }
     }
   }
 }
@@ -302,7 +302,9 @@ for chunk in r:
 - **Attachments** — send images/video via OpenAI multimodal content (`{"type":"image_url","image_url":{"url":…}}`) or a top-level `files` array (local paths / URLs / data-URIs). Muse sees them like a normal chat attachment; the `files` order numbers them 1,2,3… (see [Multiple images & numbering](#multiple-images--numbering)).
 - **Plain message** — the shim sends the latest user message **verbatim**: no `### USER/### ASSISTANT` role markers and no "continue the conversation" wrapper. Muse flags roleplay-style wrappers as prompt-injection and refuses them, so the bridge never adds any. Prior context comes from Muse's own thread.
 - **Sessions** — target a chat with header `x-muse-chat: <title|index|url>` (or body `chat`); read chats via `GET /v1/muse/chats` and `GET /v1/muse/chat`.
-- **Headers** — `x-muse-thread: new` starts a fresh side chat (over `noise` this creates a real new thread with its own event feed; over `browser` it navigates to `/` first), `x-muse-timeout-ms`.
+- **Multi-account (noise)** — set `MUSE_ACCOUNTS="acc1,acc2,acc3"` (bare ids → `./accounts/<id>`, or `id=path` for a custom dir); each account keeps its own Noise connection + quota. Route a request with header `x-muse-account: acc2` (or body `account`, or `?account=` on `/v1/muse/*`); default = first. `GET /health` lists every account's login/connection state. Seed a new account once with `muse_login` (`account` + email + mail password). Browser transport stays single-account.
+- **Load balancing (noise)** — when a request does NOT name an account, `MUSE_ACCOUNT_LB` spreads it across the pool: `round_robin` (default when >1 account) alternates accounts, `least_conn` picks the one with fewest in-flight turns, `first`/`none` pins the default. An explicit `x-muse-account`/`account` always wins; if the chosen account fails (dead connection / rate-limited), the request fails over to the next. The non-stream response echoes the serving account in an `account` field.
+- **Headers** — `x-muse-thread: new` starts a fresh side chat (over `noise` this creates a real new thread with its own event feed; over `browser` it navigates to `/` first), `x-muse-timeout-ms`, `x-muse-account`.
 
 ---
 
@@ -348,7 +350,7 @@ MCP client (Claude Desktop / opencode / …)      OpenAI client (SDK / opencode 
                        ▼
                  muse-driver.mjs        playwright-core
                        ▼
-        Chrome (dedicated profile ./.muse-profile)  ──►  https://muse.ai
+        Chrome (dedicated profile ./accounts/acc1)  ──►  https://muse.ai
 ```
 
 ### Why a browser driver?
@@ -430,7 +432,7 @@ opencode, Cursor, Cline, Aider, … anything that can read files.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `MUSE_TRANSPORT` | `browser` | `browser` (drive Chrome) or `noise` (headless, no Chrome — see below) |
-| `MUSE_PROFILE_DIR` | `./.muse-profile` | dedicated Chrome profile (holds your login) |
+| `MUSE_PROFILE_DIR` | `./accounts/acc1` | dedicated Chrome profile (holds your login) |
 | `MUSE_URL` | `https://muse.ai/` | app URL |
 | `MUSE_CHANNEL` | `chrome` | `chrome` or `msedge` |
 | `MUSE_HEADLESS=1` | off | run headless (log in headed first) |
@@ -442,6 +444,9 @@ opencode, Cursor, Cline, Aider, … anything that can read files.
 | `MUSE_SHIM_TIMEOUT_MS` | `240000` | default shim request timeout |
 | `MUSE_SHIM_MODELS` | `muse-spark-1.3,muse-spark-1.3-contributor,muse` | advertised model ids |
 | `MUSE_SHIM_API_KEY` | – | when set, `/v1/*` requires `Authorization: Bearer <key>` (or `x-api-key`); `/health` stays open |
+| `MUSE_ACCOUNTS` | – | multi-account (noise only): comma list of ids (bare `acc1,acc2` → `./accounts/<id>`) or `id=path`; each account = its own connection; route per request with `x-muse-account` |
+| `MUSE_ACCOUNTS_DIR` | `./accounts` | base folder for bare-id accounts in `MUSE_ACCOUNTS` (all profiles live here) |
+| `MUSE_ACCOUNT_LB` | `round_robin` | load balancing for requests that do NOT name an account (noise, >1 account): `round_robin` \| `least_conn` \| `first`/`none` (pin default). An explicit `x-muse-account`/`account` always overrides LB; a dead/rate-limited account fails over to the next |
 | `MUSE_SHIM_URL` | `http://127.0.0.1:8787/v1` | shim base url used by the CLI |
 | `MUSE_CLI_AUTOSTART=0` | off | disable the CLI auto-starting a shim |
 | `MUSE_SUBSCRIPTION_ACTION_ID` | `4029ac5c…` | RSC action id for `muse_usage` (refresh after a Muse redeploy) |
@@ -465,7 +470,7 @@ MUSE_TRANSPORT=noise node muse-server.mjs          # MCP server over noise
 MUSE_TRANSPORT=noise node muse-cli.mjs "hi"        # CLI over the noise shim
 ```
 
-It still needs your login: the cookies are read once from the same `.muse-profile`
+It still needs your login: the cookies are read once from the same `accounts/acc1`
 (headless, then closed) and reused for the session, so **log in with the browser
 transport first** (`npm run selftest`), then switch to `noise`.
 
@@ -484,7 +489,7 @@ single active session) and `muse_dump_dom` (no DOM).
 - **`loggedIn: false`** → run `muse_login` (or `npm run selftest`) and sign in in the Chrome window.
 - **`composerReady: false`** after login → `node muse-server.mjs --dump-dom`; if the DOM changed, re-derive selectors and update `SELECTORS` in `muse-driver.mjs`.
 - **Empty reply / `timedOut`** → raise `timeout_sec`; agent tasks (browsing, VM work) can take minutes. `needsApproval: true` means Muse is waiting on an in-app approval you must click.
-- **Chrome profile locked** → expected if a Chrome already uses `.muse-profile`. The driver auto-attaches to `http://127.0.0.1:9222` in that case; otherwise close that window, or start Chrome with `--remote-debugging-port=9222` and set `MUSE_CDP`.
+- **Chrome profile locked** → expected if a Chrome already uses `accounts/acc1`. The driver auto-attaches to `http://127.0.0.1:9222` in that case; otherwise close that window, or start Chrome with `--remote-debugging-port=9222` and set `MUSE_CDP`.
 - **`npm` blocked in PowerShell** → call `& "C:\Program Files\nodejs\npm.cmd"` instead of `npm`.
 
 ## Limitations

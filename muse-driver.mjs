@@ -47,7 +47,7 @@ export const SELECTORS = {
 
 const APP_URL = process.env.MUSE_URL || 'https://muse.ai/'
 const PROFILE_DIR =
-  process.env.MUSE_PROFILE_DIR || path.join(__dirname, '.muse-profile')
+  process.env.MUSE_PROFILE_DIR || path.join(__dirname, 'accounts', 'acc1')
 const HEADLESS = process.env.MUSE_HEADLESS === '1'
 const CHANNEL = process.env.MUSE_CHANNEL || 'chrome'
 const LAUNCH_TIMEOUT = Number(process.env.MUSE_LAUNCH_TIMEOUT_MS || 60000)
@@ -59,8 +59,9 @@ const STREAM_QUIET_MS = Number(process.env.MUSE_STREAM_QUIET_MS || 600)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const log = (...a) => console.error('[muse-driver]', ...a)
 
-class MuseDriver {
-  constructor() {
+export class MuseDriver {
+  constructor(profileDir = process.env.MUSE_PROFILE_DIR || path.join(__dirname, 'accounts', 'acc1')) {
+    this.profileDir = profileDir
     this.ctx = null
     this.page = null
     this.browser = null
@@ -84,7 +85,7 @@ class MuseDriver {
     const { chromium } = await import('playwright-core')
 
     const launchPersistent = () =>
-      chromium.launchPersistentContext(PROFILE_DIR, {
+      chromium.launchPersistentContext(this.profileDir, {
         channel: CHANNEL,
         headless: HEADLESS,
         viewport: { width: 1366, height: 900 },
@@ -126,7 +127,7 @@ class MuseDriver {
           await attachCDP('http://127.0.0.1:9222')
         } catch {
           throw new Error(
-            `Could not open the Muse Chrome profile (${PROFILE_DIR}): it is locked by ` +
+            `Could not open the Muse Chrome profile (${this.profileDir}): it is locked by ` +
               `another Chrome window, and no debugger is listening on 127.0.0.1:9222. ` +
               `Close the Chrome window using this profile, or restart it with ` +
               `--remote-debugging-port=9222 and set MUSE_CDP=http://127.0.0.1:9222.`,
@@ -223,7 +224,7 @@ class MuseDriver {
     const running = this.isRunning()
     const url = running ? this.page.url() : null
     if (!running) {
-      return { browserRunning: false, url: null, loggedIn: false, composerReady: false, profileDir: PROFILE_DIR, headless: HEADLESS }
+      return { browserRunning: false, url: null, loggedIn: false, composerReady: false, profileDir: this.profileDir, headless: HEADLESS }
     }
     const auth = await this.checkAuth()
     const composerReady = await this.hasComposer()
@@ -233,7 +234,7 @@ class MuseDriver {
       loggedIn: auth.ok,
       viewerId: auth.viewerId || null,
       composerReady,
-      profileDir: PROFILE_DIR,
+      profileDir: this.profileDir,
       headless: HEADLESS,
     }
   }

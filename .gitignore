@@ -5,6 +5,9 @@ package-lock.json
 # the dedicated Chrome profile that holds YOUR login — never commit this
 .muse-profile/
 *.muse-profile/
+# Chrome/Muse profiles (single-account default + multi-account pool) — never commit
+accounts/
+profiles/
 
 # captures / secrets — never commit
 *.har

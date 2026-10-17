@@ -65,12 +65,13 @@ export function buildServer() {
         mail_password: z.string().optional().describe('mailtemp.vn mailbox password (site/unlock OTP flow). Env MUSE_MAIL_PASSWORD.'),
         mail_api_key: z.string().optional().describe('mailtemp.vn public API key (x-api-key), preferred over mail_password for reading OTP. Env MUSE_MAILTEMP_API_KEY.'),
         auto: z.boolean().optional().describe('Set false to force interactive sign-in even when credentials are present.'),
+        account: z.string().optional().describe('Account id to sign in (from MUSE_ACCOUNTS; default = first). Noise transport only.'),
       },
     },
-    wrap(async ({ timeout_sec, email, meta_password, mail_password, mail_api_key, auto }) =>
+    wrap(async ({ timeout_sec, email, meta_password, mail_password, mail_api_key, auto, account }) =>
       transport.login({
         timeoutMs: (timeout_sec || 300) * 1000,
-        email, metaPassword: meta_password, mailPassword: mail_password, apiKey: mail_api_key, auto,
+        email, metaPassword: meta_password, mailPassword: mail_password, apiKey: mail_api_key, auto, account,
       }),
     ),
   )
@@ -96,10 +97,11 @@ export function buildServer() {
         new_thread: z.boolean().optional().describe('Start a new thread before sending (default false = continue current thread).'),
         files: z.array(z.string()).optional().describe('Absolute paths or URLs of images/videos/files to attach to the message.'),
         chat: z.union([z.string(), z.number()]).optional().describe('Target chat by title, index, thread URL, or thread id (default: main chat).'),
+        account: z.string().optional().describe('Account id to route to (see muse_status accounts; default = first). Noise transport only.'),
       },
     },
-    wrap(async ({ prompt, timeout_sec, new_thread, files, chat }) =>
-      transport.chat(prompt || '', { timeoutMs: (timeout_sec || 240) * 1000, newThread: !!new_thread, files, chat }),
+    wrap(async ({ prompt, timeout_sec, new_thread, files, chat, account }) =>
+      transport.chat(prompt || '', { timeoutMs: (timeout_sec || 240) * 1000, newThread: !!new_thread, files, chat, account }),
     ),
   )
 
@@ -120,9 +122,10 @@ export function buildServer() {
       description: 'List the chats in the Muse sidebar (Main chat, Channels, Side chats) with an active flag. Optionally filter by title.',
       inputSchema: {
         query: z.string().optional().describe('Optional case-insensitive title filter.'),
+        account: z.string().optional().describe('Account id (see muse_status accounts; default = first). Noise transport only.'),
       },
     },
-    wrap(async ({ query }) => transport.listChats(query)),
+    wrap(async ({ query, account }) => transport.listChats(query, { account })),
   )
 
   server.registerTool(
@@ -145,11 +148,12 @@ export function buildServer() {
       inputSchema: {
         chat: z.union([z.string(), z.number()]).optional().describe('Optional chat to open first (title, index, URL, or id).'),
         max: z.number().int().positive().max(500).optional().describe('Max messages to return from the end (default 100).'),
+        account: z.string().optional().describe('Account id (see muse_status accounts; default = first). Noise transport only.'),
       },
     },
-    wrap(async ({ chat, max }) => {
-      if (chat !== undefined && chat !== null && chat !== '') await transport.openChat(chat)
-      return transport.readChat(max || 100)
+    wrap(async ({ chat, max, account }) => {
+      if (chat !== undefined && chat !== null && chat !== '') await transport.openChat(chat, { account })
+      return transport.readChat(max || 100, { account })
     }),
   )
 
@@ -162,9 +166,10 @@ export function buildServer() {
         chat: z.union([z.string(), z.number()]).optional().describe('Chat to open first (title, index, URL, or id).'),
         download: z.boolean().optional().describe('Download the media to disk (default false).'),
         dir: z.string().optional().describe('Directory for downloads (default: ./downloads next to the server).'),
+        account: z.string().optional().describe('Account id (see muse_status accounts; default = first). Noise transport only.'),
       },
     },
-    wrap(async ({ chat, download, dir }) => transport.chatMedia(chat, { download: !!download, dir })),
+    wrap(async ({ chat, download, dir, account }) => transport.chatMedia(chat, { download: !!download, dir, account })),
   )
 
   server.registerTool(
@@ -172,9 +177,11 @@ export function buildServer() {
     {
       title: 'Muse usage',
       description: 'Report your Muse plan and usage: weekly limit % used and reset date, plus additional-token balance (the Settings > Usage meter).',
-      inputSchema: {},
+      inputSchema: {
+        account: z.string().optional().describe('Account id (see muse_status accounts; default = first). Noise transport only.'),
+      },
     },
-    wrap(async () => transport.usage()),
+    wrap(async ({ account }) => transport.usage({ account })),
   )
 
   server.registerTool(
