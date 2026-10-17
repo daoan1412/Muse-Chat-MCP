@@ -208,6 +208,7 @@ class NoiseTransport {
           ...(r.replyReady ? {} : { timedOut: true }),
         }
       } catch (e) {
+        if (e.noRetry) throw e // Muse itself reported an error: return it to the caller as-is
         log('chat attempt', attempt, 'failed:', e.message)
         try { this.client?.close() } catch {}
         this.client = null // keep cookies; force a fresh connection on retry

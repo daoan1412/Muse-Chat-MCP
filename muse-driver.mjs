@@ -26,7 +26,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { SUBSCRIPTION_ACTION_ID, parseFlightResult } from './muse-noise.mjs'
+import { SUBSCRIPTION_ACTION_ID, parseFlightResult, isMuseSorry, museSorryError } from './muse-noise.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -473,7 +473,7 @@ class MuseDriver {
 
   /** Send a prompt and wait for the full assistant reply. */
   async chat(prompt, opts = {}) {
-    return this._serial(() => this._run(prompt, opts))
+    return this._serial(() => this._run(prompt, opts)).then(failOnSorry)
   }
 
   /**
@@ -481,7 +481,7 @@ class MuseDriver {
    * @param {(fullText:string)=>void} opts.onDelta called with the cumulative reply text
    */
   async chatStream(prompt, opts = {}) {
-    return this._serial(() => this._run(prompt, opts))
+    return this._serial(() => this._run(prompt, opts)).then(failOnSorry)
   }
 
   async readLast() {
@@ -708,3 +708,8 @@ class MuseDriver {
 
 export const driver = new MuseDriver()
 export default driver
+
+function failOnSorry(r) {
+  if (isMuseSorry(r && r.reply)) throw museSorryError(r.reply)
+  return r
+}

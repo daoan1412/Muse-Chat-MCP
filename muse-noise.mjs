@@ -580,7 +580,25 @@ export class MuseNoiseClient {
   // Full turn. newSession=true creates a brand-new side chat (thread): we send
   // FIRST (which materializes the session server-side), THEN subscribe — the
   // reverse order yields zero events for a not-yet-existing session.
-  async chat(prompt, { nodeId = crypto.randomUUID(), timeoutMs = 120000, onEvent, attachments = [], sessionId = null, newSession = false } = {}) {
+  // Retries transient failures (ack `request timeout`, stalled stream) with a fresh
+  // session per attempt. Env: MUSE_RETRY (default 2 retries), MUSE_RETRY_BACKOFF_MS (2000),
+  // MUSE_STALL_FIRST_MS (180000: no event at all after the ack), MUSE_STALL_IDLE_MS (120000: gap between events).
+  async chat(prompt, opts = {}) {
+    const retries = Number(process.env.MUSE_RETRY ?? 2)
+    const backoff = Number(process.env.MUSE_RETRY_BACKOFF_MS ?? 2000)
+    for (let attempt = 0; ; attempt++) {
+      try { return await this._chatOnce(prompt, opts) }
+      catch (e) {
+        const retryable = e.stalled || /^request timeout POST \/chat\/stream/.test(e.message || '')
+        if (!retryable) throw e
+        // an ack timeout on a reused session may have been delivered: only auto-retry fresh sessions or stalls before any event
+        if (attempt >= retries || !(opts.newSession || e.stalled || !sessionIdReused(opts))) { e.noRetry = true; e.attempts = attempt + 1; throw e }
+        await new Promise(r => setTimeout(r, backoff * (attempt + 1) + Math.random() * 500))
+        if (opts.onRetry) try { opts.onRetry(attempt + 1, e) } catch {}
+      }
+    }
+  }
+  async _chatOnce(prompt, { nodeId = crypto.randomUUID(), timeoutMs = 120000, onEvent, attachments = [], sessionId = null, newSession = false } = {}) {
     let text = prompt
     for (const a of attachments) { const alt = String(a.name || '').replace(/[\]\[]/g, ''); text += `\n![${alt}](${a.uri})` }
     const sid = newSession ? crypto.randomUUID() : sessionId
@@ -596,10 +614,22 @@ export class MuseNoiseClient {
     }
     const events = []
     const deadline = Date.now() + timeoutMs
+    const stallFirst = Number(process.env.MUSE_STALL_FIRST_MS ?? 180000), stallIdle = Number(process.env.MUSE_STALL_IDLE_MS ?? 120000)
+    let lastEv = Date.now()
     let reply = '', replyReady = false, assistantMessageId = null
     while (Date.now() < deadline) {
-      const ev = await sub.nextEvent(Math.max(50, deadline - Date.now()))
-      if (ev === null) { if (sub.isClosed() || sub.getError()) break; continue }
+      const ev = await sub.nextEvent(Math.max(50, Math.min(deadline - Date.now(), 5000)))
+      if (ev === null) {
+        if (sub.isClosed() || sub.getError()) break
+        if (Date.now() - lastEv > (events.length ? stallIdle : stallFirst)) {
+          sub.stop()
+          const e = new Error(`stalled: no event for ${Math.round((Date.now() - lastEv) / 1000)}s (${events.length} events so far)`)
+          e.stalled = true
+          throw e
+        }
+        continue
+      }
+      lastEv = Date.now()
       events.push(ev)
       if (onEvent) onEvent(ev)
       const name = ev.event || ev.event_name
@@ -615,6 +645,7 @@ export class MuseNoiseClient {
       }
     }
     sub.stop()
+    if (isMuseSorry(reply)) throw museSorryError(reply, sid)
     return { ack, events, reply, replyReady, assistantMessageId, sessionId: sid }
   }
   close() { this._pumping = false; try { this.ws?.close() } catch {} this.ws = null; this.transport = null }
@@ -661,3 +692,15 @@ if (isMain) {
     process.exit(0)
   }).catch((e) => { console.error('[noise] fatal', e.message); process.exit(1) })
 }
+
+// Muse answers with this canned text when its backend fails; surface it as an error.
+const SORRY_RE = /^\s*Sorry, I ran into a problem while responding\.?\s*Please try again\.?\s*$/i
+export function isMuseSorry(text) { return SORRY_RE.test(String(text || '')) }
+export function museSorryError(text, sessionId) {
+  const e = new Error(String(text).trim())
+  e.noRetry = true
+  e.museError = true
+  if (sessionId) e.sessionId = sessionId
+  return e
+}
+function sessionIdReused(opts) { return !!opts.sessionId }
