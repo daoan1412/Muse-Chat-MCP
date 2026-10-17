@@ -17,10 +17,12 @@
  *       --new-thread        start a fresh Muse thread first
  *       --no-stream         wait for the full reply, then print it
  *       --json              print the raw OpenAI response JSON
+ *       --json-schema <inline|file>  force the reply to match a JSON Schema (implies --no-stream)
  *       --base <url>        shim base url (default env MUSE_SHIM_URL or .../v1)
  *   -h, --help              show this help
  */
 import { spawn } from 'node:child_process'
+import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -28,7 +30,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const SERVER = path.join(__dirname, 'muse-server.mjs')
 
 const argv = process.argv.slice(2)
-const opt = { model: 'muse-spark-1.3', timeout: 180000, stream: true, json: false, newThread: false, system: '', files: [], chat: undefined, listChats: false, read: undefined, query: undefined, media: undefined, download: false, dir: undefined }
+const opt = { model: 'muse-spark-1.3', timeout: 180000, stream: true, json: false, newThread: false, system: '', files: [], chat: undefined, listChats: false, read: undefined, query: undefined, media: undefined, download: false, dir: undefined, schema: undefined, usage: false }
 const positional = []
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i]
@@ -39,9 +41,11 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--new-thread') opt.newThread = true
   else if (a === '--no-stream') opt.stream = false
   else if (a === '--json') opt.json = true
+  else if (a === '--json-schema' || a === '--schema') opt.schema = argv[++i]
   else if (a === '-f' || a === '--file' || a === '--image') opt.files.push(argv[++i])
   else if (a === '--chat') opt.chat = argv[++i]
   else if (a === '--list-chats') opt.listChats = true
+  else if (a === '--usage') opt.usage = true
   else if (a === '--query') opt.query = argv[++i]
   else if (a === '--media') { const nxt = argv[i + 1]; if (nxt && !nxt.startsWith('-')) { opt.media = nxt; i++ } else opt.media = '' }
   else if (a === '--download') opt.download = true
@@ -52,14 +56,24 @@ for (let i = 0; i < argv.length; i++) {
   else positional.push(a)
 }
 
+// --json-schema accepts inline JSON or a path to a .json schema file.
+function loadSchema(s) {
+  const t = String(s).trim()
+  if (t.startsWith('{') || t.startsWith('[')) { try { return JSON.parse(t) } catch {} }
+  try { return JSON.parse(fs.readFileSync(s, 'utf8')) }
+  catch { throw new Error(`--json-schema: "${s}" is neither inline JSON nor a readable JSON file`) }
+}
+
 function printHelp() {
   process.stdout.write(
     'Usage: muse-cli [options] "prompt"\n' +
       '       echo "prompt" | muse-cli [options]\n\n' +
       'Options: -s/--system, -m/--model, -t/--timeout, --new-thread, --no-stream, --json, --base\n' +
+      '         --json-schema <inline|file>  force the reply to match a JSON Schema (implies --no-stream)\n' +
       '         -f/--file <path|url>   attach an image/video/file (repeatable)\n' +
       '         --chat <name|index|url>  send to a specific Muse chat (default: main chat)\n' +
       '         --list-chats           list Muse chats and exit\n' +
+      '         --usage                show your plan + weekly usage / additional tokens and exit\n' +
       '         --query <text>         filter --list-chats by title\n' +
       '         --read [<name|index|url>]  read a chat (current chat if omitted) and exit\n' +
       '         --media [<name|index|url>]  list media links in a chat and exit\n' +
@@ -105,9 +119,20 @@ async function ensureShim() {
 function cleanup() { if (child) { try { child.kill() } catch {} child = null } }
 
 async function main() {
-  // Session reading / media modes (no prompt).
-  if (opt.listChats || opt.read !== undefined || opt.media !== undefined) {
+  // Session reading / media / usage modes (no prompt).
+  if (opt.listChats || opt.read !== undefined || opt.media !== undefined || opt.usage) {
     await ensureShim()
+    if (opt.usage) {
+      const d = await (await fetch(BASE + '/muse/usage')).json()
+      if (opt.json) process.stdout.write(JSON.stringify(d, null, 2) + '\n')
+      else {
+        const u = d.usage || {}
+        process.stdout.write(`Plan: ${d.usageRowLabel || d.tier?.name || '?'}\n`)
+        process.stdout.write(`Usage: ${d.usageRowValueLabel || (u.percentUsed != null ? u.percentUsed + '% used' : '?')}\n`)
+        if (d.statusSubtitle) process.stdout.write(`${d.statusSubtitle}\n`)
+        if (d.topupRowLabel) process.stdout.write(`${d.topupRowLabel}: ${d.topupRowValueLabel || '?'}\n`)
+      }
+    }
     if (opt.listChats) {
       const u = BASE + '/muse/chats' + (opt.query ? '?query=' + encodeURIComponent(opt.query) : '')
       const d = await (await fetch(u)).json()
@@ -140,6 +165,9 @@ async function main() {
 
   await ensureShim()
 
+  const schemaObj = opt.schema !== undefined ? loadSchema(opt.schema) : null
+  if (schemaObj) opt.stream = false
+
   const messages = []
   if (opt.system) messages.push({ role: 'system', content: opt.system })
   messages.push({ role: 'user', content: prompt })
@@ -148,18 +176,23 @@ async function main() {
   if (opt.newThread) headers['x-muse-thread'] = 'new'
   headers['x-muse-timeout-ms'] = String(opt.timeout)
 
+  const body = { model: opt.model, messages, stream: opt.stream, files: opt.files.length ? opt.files : undefined, chat: opt.chat !== undefined ? opt.chat : undefined }
+  if (schemaObj) body.response_format = { type: 'json_schema', json_schema: { name: 'response', schema: schemaObj, strict: false } }
+
   const res = await fetch(BASE + '/chat/completions', {
     method: 'POST',
     headers,
-    body: JSON.stringify({ model: opt.model, messages, stream: opt.stream, files: opt.files.length ? opt.files : undefined, chat: opt.chat !== undefined ? opt.chat : undefined }),
+    body: JSON.stringify(body),
   })
 
   if (!opt.stream) {
     const j = await res.json()
     if (j.error) { process.stderr.write('muse error: ' + JSON.stringify(j.error) + '\n'); process.exit(1) }
     const msg = j.choices?.[0]?.message
+    const content = typeof msg?.content === 'string' ? msg.content : JSON.stringify(msg)
     if (opt.json) process.stdout.write(JSON.stringify(j, null, 2) + '\n')
-    else process.stdout.write((typeof msg?.content === 'string' ? msg.content : JSON.stringify(msg)) + '\n')
+    else if (schemaObj) { try { process.stdout.write(JSON.stringify(JSON.parse(content), null, 2) + '\n') } catch { process.stdout.write(content + '\n') } }
+    else process.stdout.write(content + '\n')
     return
   }
 

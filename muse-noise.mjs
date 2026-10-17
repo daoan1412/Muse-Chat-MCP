@@ -25,6 +25,9 @@ const C = globalThis.crypto || globalThis.webcrypto
 const LB_HOST = process.env.MUSE_NOISE_HOST || 'hatch.metaaivm.com'
 const NOISE_PATH = '/v1/noise'
 const APP_ID = 'hatch-web'
+// Next.js RSC server-action id for fetchSubscriptionAction (the Usage/credits
+// meter). Build-specific hash — override with MUSE_SUBSCRIPTION_ACTION_ID after a redeploy.
+export const SUBSCRIPTION_ACTION_ID = process.env.MUSE_SUBSCRIPTION_ACTION_ID || '4029ac5c4bd03136487d91ebde5de39c64b35229b4'
 const PROTONAME = 'Noise_XX_25519_AESGCM_SHA256'
 const CHUNK_MAX = 65489
 // Capabilities the real client sends in chat.subscribe (buildHatchChatCapabilities).
@@ -301,6 +304,19 @@ class NoiseTransport {
 }
 
 // ------------------------------------------------------------------ client
+// Parse a Next.js RSC "flight" action response into the returned value.
+// The result object is referenced by the first line's `a` field (`$@N` -> line N).
+export function parseFlightResult(txt) {
+  const lines = String(txt).split('\n').filter(Boolean)
+  if (!lines.length) throw new Error('empty flight response')
+  let ref = '1'
+  const m = lines[0].match(/^0:(\{.*\})\s*$/)
+  if (m) { try { const a = (JSON.parse(m[1]).a || ''); const mm = a.match(/\$(\d+)/); if (mm) ref = mm[1] } catch {} }
+  const line = lines.find((l) => l.startsWith(ref + ':'))
+  if (!line) throw new Error('no result line ' + ref)
+  return JSON.parse(line.slice(ref.length + 1))
+}
+
 export class MuseNoiseClient {
   constructor({ cookies, origin = 'https://muse.ai', ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36', log = () => {} } = {}) {
     this.cookieHeader = Array.isArray(cookies) ? cookies.map((c) => `${c.name}=${c.value}`).join('; ') : (cookies || '')
@@ -333,6 +349,38 @@ export class MuseNoiseClient {
     try { json = JSON.parse(txt) } catch {}
     if (!res.ok) throw new Error(`${method} ${path} -> ${res.status}: ${txt.slice(0, 200)}`)
     return json
+  }
+  // Usage/credits meter via the Next.js RSC server action fetchSubscriptionAction.
+  // Plain HTTPS POST to the app origin (no noise WS needed) — only the login cookies.
+  // Cloudflare bot-checks the request, so send full browser client-hint headers.
+  async usage({ includeAgreement = true } = {}) {
+    const res = await fetch(this.origin + '/', {
+      method: 'POST',
+      headers: {
+        accept: 'text/x-component',
+        'accept-encoding': 'gzip, deflate, br',
+        'accept-language': 'en-US,en;q=0.9',
+        'content-type': 'text/plain;charset=UTF-8',
+        'next-action': SUBSCRIPTION_ACTION_ID,
+        origin: this.origin,
+        referer: this.origin + '/',
+        'sec-ch-prefers-color-scheme': 'light',
+        'sec-ch-ua': '"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Linux"',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-origin',
+        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
+        cookie: this.cookieHeader,
+      },
+      body: JSON.stringify([{ includeAgreement }]),
+    })
+    const txt = await res.text()
+    if (!res.ok) throw new Error(`usage action -> ${res.status}: ${txt.slice(0, 200)}`)
+    const r = parseFlightResult(txt)
+    if (!r || !r.success) throw new Error('usage action failed: ' + JSON.stringify((r && r.error) || r).slice(0, 200))
+    return r.subscription
   }
   async bootstrap() {
     const auth = await this.rest('POST', '/api/auth/check', {})

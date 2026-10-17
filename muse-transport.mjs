@@ -275,6 +275,15 @@ class NoiseTransport {
     }
     return result
   }
+  // Usage needs only the login cookies (plain HTTPS RSC action), not the noise WS.
+  async usage() {
+    let c = this.client
+    if (!c) {
+      if (!this.cookies) this.cookies = await grabCookies()
+      c = new MuseNoiseClient({ cookies: this.cookies, log })
+    }
+    return { ...(await c.usage()), transport: 'noise' }
+  }
   async dumpDom() { return { note: 'dump_dom is a browser-only diagnostic (noise transport has no DOM)', transport: 'noise' } }
   async close() { try { this.client?.close() } catch {} this.client = null }
 }

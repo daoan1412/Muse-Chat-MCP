@@ -8,7 +8,7 @@ That gives you two front doors:
 
 | Front door | What it is | Use it from |
 | --- | --- | --- |
-| **MCP server** (stdio) | 7 tools: `muse_status`, `muse_login`, `muse_new_chat`, `muse_chat`, `muse_read_last`, `muse_dump_dom`, `muse_close` | Claude Desktop, opencode, Cursor, any MCP host |
+| **MCP server** (stdio) | 12 tools: `muse_status`, `muse_login`, `muse_new_chat`, `muse_chat`, `muse_read_last`, `muse_chats`, `muse_open_chat`, `muse_read_chat`, `muse_media`, `muse_usage`, `muse_dump_dom`, `muse_close` | Claude Desktop, opencode, Cursor, any MCP host |
 | **OpenAI-compatible shim** (HTTP) | `GET /v1/models`, `POST /v1/chat/completions` (stream + non-stream, tool calling) | any OpenAI SDK / `@ai-sdk/openai-compatible` provider |
 
 Plus a tiny **CLI** (`muse-cli.mjs`) for one-shot generation from scripts.
@@ -25,6 +25,7 @@ Plus a tiny **CLI** (`muse-cli.mjs`) for one-shot generation from scripts.
 - **Prompt-injected tool calling** — expose OpenAI `tools` to Muse and get `tool_calls` back.
 - **Attachments** — send images/video with a prompt (MCP `files`, OpenAI `image_url` parts, CLI `-f`).
 - **Sessions & media** — list/open/read/send in any Muse chat, and pull out the images/videos Muse generates (links + download).
+- **Usage / quota** — read your plan, weekly usage % + reset date, and additional-token balance headlessly (`muse_usage` / `--usage` / `GET /v1/muse/usage`).
 - **Muse Manual** — a living guide to Muse's video/image/content capabilities at [`manual/MUSE_MANUAL.md`](manual/MUSE_MANUAL.md), regenerated with `node manual/interview.mjs`.
 - **Reuses your existing login** via a dedicated Chrome profile, or attaches to a Chrome you already run with `--remote-debugging-port=9222`.
 - **Never kills your browser**: when attached over CDP it only *disconnects* on close.
@@ -113,6 +114,7 @@ Add to `claude_desktop_config.json`:
 | `muse_open_chat` | `target` | open a chat (title, index, URL, or id) |
 | `muse_read_chat` | `chat?`, `max?` | messages of a chat (all roles, with media links) |
 | `muse_media` | `chat?`, `download?`, `dir?` | image/video/attachment links from a chat (optionally downloaded) |
+| `muse_usage` | – | plan + weekly usage % / reset date and additional-token balance (the Settings → Usage meter) |
 | `muse_dump_dom` | `max_chars?` | element counts + transcript HTML (selector debugging) |
 | `muse_close` | – | closes the browser (disconnect-only if CDP-attached) |
 
@@ -153,6 +155,27 @@ Extract and download them:
 
 Links are public (anyone with the link can view) but expire (~2 days) — download to keep them.
 
+### Usage / quota
+
+Read your plan and the Settings → Usage meter (weekly limit % used + reset date, and the
+additional-token balance) without opening the browser UI:
+
+- **MCP** — `muse_usage`.
+- **HTTP** — `GET /v1/muse/usage`.
+- **CLI** — `--usage` (add `--json` for the full payload).
+
+```bash
+node muse-cli.mjs --usage
+# Plan: Free plan
+# Usage: 4% used
+# Weekly limit resets on Oct 18
+# Additional tokens: 0% used (1B tokens left)
+```
+
+It reads the `fetchSubscriptionAction` RSC action (works on both transports). The action id is
+build-specific; after a Muse redeploy refresh it with `node tools/capture-subaction.mjs` or set
+`MUSE_SUBSCRIPTION_ACTION_ID`.
+
 ---
 
 ## Use the OpenAI-compatible shim
@@ -167,6 +190,7 @@ Links are public (anyone with the link can view) but expire (~2 days) — downlo
 | `GET /v1/muse/chats` | list Muse chats |
 | `GET /v1/muse/chat?target=…` | read a chat (optionally opening it first) |
 | `GET /v1/muse/media?target=…` | media links in a chat (add `download=1` to save) |
+| `GET /v1/muse/usage` | plan + weekly usage % / reset date and additional-token balance |
 
 ```bash
 curl http://127.0.0.1:8787/v1/models
@@ -210,6 +234,7 @@ for chunk in r:
 
 - **Real streaming** — DOM text is re-emitted as OpenAI deltas. Only text that is a *monotonic extension* and has been stable for `MUSE_STREAM_QUIET_MS` (default 600 ms) is emitted; the remainder is flushed at the end. Each stream ends with exactly one `finish_reason`, then `[DONE]`.
 - **Tools** — prompt-injected. Tool schemas are embedded with a *decision-only* rule ("do not execute"), so Muse returns `{"tool_calls":[{"name","arguments"}]}` instead of trying to actually run the action. Parsed into OpenAI `tool_calls` (`finish_reason: "tool_calls"`). Best-effort, not a native function-calling API.
+- **Structured output** — `response_format` (`{"type":"json_object"}` or `{"type":"json_schema","json_schema":{"schema":…}}`) constrains the reply to schema-valid JSON: the schema is injected into the prompt, the reply is extracted (prose/fences stripped), validated with Ajv, and Muse is re-asked up to `MUSE_SCHEMA_RETRY` (default 2) times. Returns `finish_reason: "stop"` with `content` as the JSON string.
 - **Attachments** — send images/video via OpenAI multimodal content (`{"type":"image_url","image_url":{"url":…}}`) or a top-level `files` array (local paths / URLs / data-URIs). Muse sees them like a normal chat attachment.
 - **Plain message** — the shim sends the latest user message **verbatim**: no `### USER/### ASSISTANT` role markers and no "continue the conversation" wrapper. Muse flags roleplay-style wrappers as prompt-injection and refuses them, so the bridge never adds any. Prior context comes from Muse's own thread.
 - **Sessions** — target a chat with header `x-muse-chat: <title|index|url>` (or body `chat`); read chats via `GET /v1/muse/chats` and `GET /v1/muse/chat`.
@@ -231,14 +256,18 @@ node muse-cli.mjs --list-chats --query "video"                                # 
 node muse-cli.mjs --read "Video creation capability"                          # read a chat's latest reply
 node muse-cli.mjs --chat "Video creation capability" "Reply with pong"        # send into a specific chat
 node muse-cli.mjs --media --download --dir ./out                              # fetch generated images/video, save to ./out
+node muse-cli.mjs --usage                                                     # plan + weekly usage % / reset + additional tokens
 node muse-cli.mjs --new-thread "Solve 2x^2 - 5x + 3 = 0"                      # fresh side chat (isolated; parallel-safe over noise)
+node muse-cli.mjs --json-schema ./schema.json "Extract name and age from this bio"   # force schema-valid JSON (implies --no-stream)
 echo "<file contents>" | node muse-cli.mjs -s "Review this file"              # prompt from stdin
 npm run muse -- "hello"                                                       # via package.json
 ```
 
-Options: `-s/--system <text>`, `-m/--model <id>` (default `muse-spark-1.3`), `-t/--timeout <ms>` (default 180000), `-f/--file/--image <path|url>` (repeatable), `--chat <name|index|url>`, `--list-chats`, `--query <text>`, `--read [<chat>]`, `--media [<chat>]`, `--download`, `--dir <dir>`, `--new-thread`, `--no-stream`, `--json`, `--base <url>` (or env `MUSE_SHIM_URL`), `-h/--help`.
+Options: `-s/--system <text>`, `-m/--model <id>` (default `muse-spark-1.3`), `-t/--timeout <ms>` (default 180000), `-f/--file/--image <path|url>` (repeatable), `--chat <name|index|url>`, `--list-chats`, `--query <text>`, `--read [<chat>]`, `--media [<chat>]`, `--download`, `--dir <dir>`, `--usage`, `--new-thread`, `--no-stream`, `--json`, `--json-schema <inline|file>`, `--base <url>` (or env `MUSE_SHIM_URL`), `-h/--help`.
 
 `--new-thread` starts a fresh side chat. Over `noise` this is a real new thread with its own event feed, so many `--new-thread` requests run **in parallel, isolated** (see [Sessions](#sessions-multiple-chats)). Over `browser` it navigates to `/` first (best-effort) and requests are serialized.
+
+`--json-schema <inline JSON | path to a .json>` forces the reply to match a JSON Schema (OpenAI `response_format` → `json_schema`): the schema is injected into the prompt, the reply is extracted and validated with Ajv, and Muse is re-asked (up to `MUSE_SCHEMA_RETRY`, default 2) until it returns schema-valid JSON. It implies `--no-stream` and prints the validated object pretty-printed (or the full envelope with `--json`). Any OpenAI client can use the same `response_format` through the shim.
 
 ---
 
@@ -349,6 +378,7 @@ opencode, Cursor, Cline, Aider, … anything that can read files.
 | `MUSE_SHIM_MODELS` | `muse-spark-1.3,muse-spark-1.3-contributor,muse` | advertised model ids |
 | `MUSE_SHIM_URL` | `http://127.0.0.1:8787/v1` | shim base url used by the CLI |
 | `MUSE_CLI_AUTOSTART=0` | off | disable the CLI auto-starting a shim |
+| `MUSE_SUBSCRIPTION_ACTION_ID` | `4029ac5c…` | RSC action id for `muse_usage` (refresh after a Muse redeploy) |
 
 ---
 
@@ -369,8 +399,8 @@ It still needs your login: the cookies are read once from the same `.muse-profil
 transport first** (`npm run selftest`), then switch to `noise`.
 
 Over `noise` the core tools work (`muse_status`, `muse_chat`, `muse_read_last`,
-`muse_read_chat`, `muse_list_chats`, `muse_chat_media`, plus the shim
-`/v1/chat/completions` incl. streaming and `/v1/muse/{chats,chat,media}`). Attachments
+`muse_read_chat`, `muse_chats`, `muse_media`, `muse_usage`, plus the shim
+`/v1/chat/completions` incl. streaming and `/v1/muse/{chats,chat,media,usage}`). Attachments
 upload through `/fs/write` into the workspace and are referenced as
 `![alt](sandbox://workspace/…)`; generated media is read back via `/fs/raw`. Only two
 features stay browser-only and degrade with a clear note: `muse_open_chat` (noise has a

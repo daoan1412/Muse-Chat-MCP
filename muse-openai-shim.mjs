@@ -22,9 +22,15 @@
  * schemas are embedded in the prompt and Muse is asked to answer with either
  * normal text or {"tool_calls":[{"name","arguments"}]}; the latter is parsed
  * into OpenAI tool_calls.
+ *
+ * Structured output: `response_format` (OpenAI `json_object` / `json_schema`)
+ * constrains the reply to schema-valid JSON — the schema is injected into the
+ * prompt, the reply is extracted, validated with Ajv, and retried on failure.
  * ------------------------------------------------------------------
  */
 import http from 'node:http'
+import Ajv from 'ajv'
+import addFormats from 'ajv-formats'
 import { transport } from './muse-transport.mjs'
 
 const PORT = Number(process.env.MUSE_SHIM_PORT || 8787)
@@ -88,6 +94,9 @@ function buildPrompt(body) {
     )
   }
 
+  const rfInfo = normalizeResponseFormat(body.response_format)
+  if (rfInfo) parts.push(schemaDirective(rfInfo))
+
   if (userText) parts.push(userText)
   return parts.join('\n\n').trim()
 }
@@ -115,6 +124,115 @@ function parseToolCalls(text) {
       }
     })
     .filter(Boolean)
+}
+
+// ---------------------------------------------------------------- structured output
+
+const ajv = new Ajv({ allErrors: true, strict: false })
+addFormats(ajv)
+const _validatorCache = new Map()
+
+function compileValidator(schema) {
+  const key = JSON.stringify(schema)
+  let v = _validatorCache.get(key)
+  if (!v) {
+    const validate = ajv.compile(schema)
+    v = (data) => { const ok = validate(data); v.errors = validate.errors; return ok }
+    _validatorCache.set(key, v)
+  }
+  return v
+}
+
+// Accept OpenAI `response_format` shapes: {type:"json_object"}, {type:"json_schema",
+// json_schema:{name,schema,strict}}, or a bare schema object. Returns null when no
+// constraint applies.
+function normalizeResponseFormat(rf) {
+  if (!rf || typeof rf !== 'object') return null
+  if (rf.type === 'text') return null
+  if (rf.type === 'json_object') return { mode: 'json_object', schema: null, name: 'response' }
+  if (rf.type === 'json_schema' || rf.type === 'jsonSchema') {
+    const js = rf.json_schema || rf.jsonSchema || rf.schema
+    if (js && typeof js === 'object') {
+      if (js.schema && typeof js.schema === 'object') return { mode: 'json_schema', schema: js.schema, name: js.name || 'response' }
+      if (js.type || js.properties || js.$schema) return { mode: 'json_schema', schema: js, name: js.name || 'response' }
+    }
+    return { mode: 'json_object', schema: null, name: 'response' }
+  }
+  if (rf.type || rf.properties || rf.$schema) return { mode: 'json_schema', schema: rf, name: 'response' }
+  return null
+}
+
+function schemaDirective(rfInfo) {
+  if (rfInfo.mode === 'json_object') {
+    return 'Respond with ONLY a single valid JSON object. No prose, no commentary, no markdown code fences.'
+  }
+  return [
+    'Respond with ONLY a single JSON object that validates against the JSON Schema below.',
+    'Output raw JSON — no prose, no commentary, no markdown code fences.',
+    'Include every required key; do not add keys the schema does not allow.',
+    'JSON Schema:',
+    JSON.stringify(rfInfo.schema),
+  ].join('\n')
+}
+
+// Pull the first balanced JSON value out of a reply that may have prose or ``` fences.
+function extractJson(text) {
+  if (!text) return { ok: false }
+  let t = String(text).trim()
+  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i)
+  if (fence) t = fence[1].trim()
+  try { return { ok: true, value: JSON.parse(t) } } catch {}
+  const start = t.search(/[{[]/)
+  if (start < 0) return { ok: false }
+  const open = t[start], close = open === '{' ? '}' : ']'
+  let depth = 0, inStr = false, esc = false, end = -1
+  for (let i = start; i < t.length; i++) {
+    const c = t[i]
+    if (inStr) { if (esc) esc = false; else if (c === '\\') esc = true; else if (c === '"') inStr = false; continue }
+    if (c === '"') { inStr = true; continue }
+    if (c === open) depth++
+    else if (c === close) { depth--; if (depth === 0) { end = i; break } }
+  }
+  if (end < 0) return { ok: false }
+  try { return { ok: true, value: JSON.parse(t.slice(start, end + 1)) } } catch { return { ok: false } }
+}
+
+function corrective(errors, rfInfo) {
+  const e = (errors || []).map((x) => (x && x.message ? x.message : String(x))).slice(0, 8).join('; ')
+  const tail = rfInfo.mode === 'json_schema' ? `\nSchema:\n${JSON.stringify(rfInfo.schema)}` : ''
+  return `\n\nYour previous reply was NOT valid. Return ONLY corrected JSON (raw, no fences). Errors: ${e || 'invalid'}.${tail}`
+}
+
+// Ask Muse until the reply parses and (if a schema) validates, or attempts run out.
+async function runStructured(basePrompt, rfInfo, validate, opts) {
+  const maxAttempts = Math.max(1, (Number(process.env.MUSE_SCHEMA_RETRY) || 2) + 1)
+  let prompt = basePrompt
+  let last = null
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const r = await transport.chat(prompt, opts)
+    if (r.error && !r.reply) throw new Error(r.error)
+    const ex = extractJson(r.reply || '')
+    if (!ex.ok) {
+      last = { raw: r.reply, errors: ['reply is not valid JSON'] }
+      prompt = basePrompt + corrective(last.errors, rfInfo)
+      log(`schema attempt ${attempt}: parse-fail`)
+      continue
+    }
+    if (validate) {
+      if (validate(ex.value)) { log(`schema attempt ${attempt}: valid`); return { obj: ex.value, attempts: attempt } }
+      const errs = (validate.errors || []).map((v) => `${v.instancePath || '/'} ${v.message}`)
+      last = { obj: ex.value, errors: errs }
+      prompt = basePrompt + corrective(errs, rfInfo)
+      log(`schema attempt ${attempt}: invalid (${errs.length} errors)`)
+      continue
+    }
+    if (ex.value && typeof ex.value === 'object') return { obj: ex.value, attempts: attempt }
+    last = { obj: ex.value, errors: ['expected a JSON object'] }
+    prompt = basePrompt + corrective(last.errors, rfInfo)
+  }
+  const err = new Error('Muse did not return schema-valid JSON')
+  err.detail = last
+  throw err
 }
 
 // Collect attachments from an OpenAI-style request:
@@ -189,6 +307,7 @@ async function handleChat(req, res, body) {
   const prompt = buildPrompt(body)
   const wantTools = Array.isArray(body.tools) && body.tools.length > 0 && body.tool_choice !== 'none'
   const stream = body.stream === true
+  const rfInfo = normalizeResponseFormat(body.response_format)
   const files = collectFiles(body)
   let chat = req.headers['x-muse-chat'] !== undefined ? req.headers['x-muse-chat'] : body.chat
   if (typeof chat === 'string') {
@@ -200,6 +319,38 @@ async function handleChat(req, res, body) {
   log(`chat model=${model} stream=${stream} tools=${wantTools} files=${files.length} target=${chat !== undefined ? chat : 'current'} promptChars=${prompt.length}`)
 
   try {
+    if (rfInfo) {
+      let validate = null
+      if (rfInfo.mode === 'json_schema') {
+        try { validate = compileValidator(rfInfo.schema) }
+        catch (e) { return sendError(res, 400, `Invalid JSON Schema: ${e.message}`, 'invalid_request_error', null, 'response_format') }
+      }
+      const out = await runStructured(prompt, rfInfo, validate, { timeoutMs, newThread, files, chat })
+      const jsonStr = JSON.stringify(out.obj)
+      if (stream) {
+        sseHeaders(res)
+        let closed = false
+        res.on('close', () => { closed = true })
+        const write = (s) => { if (!closed) { try { res.write(s) } catch { closed = true } } }
+        write(chunk(id, model, created, { role: 'assistant', content: '' }))
+        for (let i = 0; i < jsonStr.length; i += 60) write(chunk(id, model, created, { content: jsonStr.slice(i, i + 60) }))
+        write(chunk(id, model, created, {}, 'stop'))
+        if (body.stream_options && body.stream_options.include_usage) {
+          write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [], usage: { prompt_tokens: approxTokens(prompt), completion_tokens: approxTokens(jsonStr), total_tokens: approxTokens(prompt) + approxTokens(jsonStr) } })}\n\n`)
+        }
+        write('data: [DONE]\n\n')
+        res.end()
+        return
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+      res.end(JSON.stringify({
+        id, object: 'chat.completion', created, model,
+        choices: [{ index: 0, message: { role: 'assistant', content: jsonStr }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: approxTokens(prompt), completion_tokens: approxTokens(jsonStr), total_tokens: approxTokens(prompt) + approxTokens(jsonStr) },
+      }))
+      return
+    }
+
     let finishReason = 'stop'
     if (stream) {
       sseHeaders(res)
@@ -270,7 +421,9 @@ async function handleChat(req, res, body) {
     }))
   } catch (err) {
     log('error:', err && err.message)
-    sendError(res, 502, `Muse error: ${err && err.message ? err.message : String(err)}`, 'api_error')
+    let msg = `Muse error: ${err && err.message ? err.message : String(err)}`
+    if (err && err.detail && Array.isArray(err.detail.errors)) msg += ` (last attempt: ${err.detail.errors.slice(0, 6).join('; ')})`
+    sendError(res, 502, msg, 'api_error')
   }
 }
 
@@ -338,6 +491,12 @@ export function startShim({ port = PORT, host = HOST } = {}) {
         const target = params.get('target')
         const download = params.get('download') === '1' || params.get('download') === 'true'
         const data = await transport.chatMedia(target || undefined, { download, dir: params.get('dir') || undefined })
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+        return res.end(JSON.stringify(data))
+      }
+
+      if (req.method === 'GET' && url === '/v1/muse/usage') {
+        const data = await transport.usage()
         res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
         return res.end(JSON.stringify(data))
       }

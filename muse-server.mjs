@@ -158,6 +158,16 @@ export function buildServer() {
   )
 
   server.registerTool(
+    'muse_usage',
+    {
+      title: 'Muse usage',
+      description: 'Report your Muse plan and usage: weekly limit % used and reset date, plus additional-token balance (the Settings > Usage meter).',
+      inputSchema: {},
+    },
+    wrap(async () => transport.usage()),
+  )
+
+  server.registerTool(
     'muse_dump_dom',
     {
       title: 'Dump Muse DOM',

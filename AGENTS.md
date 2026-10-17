@@ -15,16 +15,20 @@ See `README.md` for usage.
 ## Map
 
 - `muse-transport.mjs` — `MUSE_TRANSPORT` switch; facade both backends expose the same
-  methods the server/shim call (`status`/`login`/`chat`/`chatStream`/`readLast`/`readChat`/`close`).
-- `muse-driver.mjs` — browser driver (selectors, `_run`/`chat`/`chatStream`, `_serial`).
+  methods the server/shim call (`status`/`login`/`chat`/`chatStream`/`readLast`/`readChat`/`usage`/`close`).
+- `muse-driver.mjs` — browser driver (selectors, `_run`/`chat`/`chatStream`, `_serial`, `usage`).
 - `muse-noise.mjs` — headless Noise_XX client: `Noise_XX_25519_AESGCM_SHA256` handshake,
-  protobuf HTTP/2-mux framing, REST bootstrap, `chatHistory`/`chatSubscribe`/`chat`.
-- `muse-server.mjs` — MCP stdio server (7 tools) + shim bootstrap; `--self-test`,
-  `--dump-dom`, `--serve-only`.
-- `muse-openai-shim.mjs` — OpenAI shim (`/v1/models`, `/v1/chat/completions`).
-- `muse-cli.mjs` — CLI over the shim.
+  protobuf HTTP/2-mux framing, REST bootstrap, `chatHistory`/`chatSubscribe`/`chat`/`usage`.
+- `muse-server.mjs` — MCP stdio server (12 tools incl. `muse_usage`) + shim bootstrap;
+  `--self-test`, `--dump-dom`, `--serve-only`.
+- `muse-openai-shim.mjs` — OpenAI shim (`/v1/models`, `/v1/chat/completions`, `response_format`
+  structured output, `/v1/muse/chats|chat|media|usage`).
+- `muse-cli.mjs` — CLI over the shim (`--json-schema` forces schema-valid JSON, `--usage` prints the meter).
 - `tools/capture-noise.mjs` — Playwright capture harness (login + WS frames + JS bundles).
 - `tools/noise-chat.mjs` — end-to-end test of the headless client (`--history`, `MUSE_DUMP_EVENTS=1`).
+- `tools/discover-usage.mjs` / `tools/capture-subaction.mjs` — recon: open Settings→Usage, read the
+  rendered meter, and capture the `fetchSubscriptionAction` RSC request/response (re-run after a
+  redeploy to refresh `MUSE_SUBSCRIPTION_ACTION_ID`).
 - `docs/index.html` — GitHub Pages landing page.
 
 ## Invariants (do not break)
@@ -35,6 +39,16 @@ See `README.md` for usage.
 - Tool calling is **decision-only** (Muse must not actually execute the tool).
 - Prompts are sent **verbatim** — never add `### USER/### ASSISTANT` roleplay markers or a
   "continue the conversation" wrapper; Muse flags those as prompt-injection and refuses.
+- Structured output (`response_format` `json_object`/`json_schema`) is prompt-injected, Ajv-validated,
+  and retried up to `MUSE_SCHEMA_RETRY` (default 2); the schema directive is appended, but the verbatim
+  rule (no roleplay markers) still applies to the user's own text.
+- Usage/credits (`muse_usage` / `--usage` / `transport.usage()`) comes from the Next.js RSC server
+  action `fetchSubscriptionAction`, NOT a noise route (it is absent from the route table). POST the
+  action id to the app origin with `accept: text/x-component` + `content-type: text/plain` +
+  `next-action` and full browser client-hint headers (`sec-ch-ua*`, `accept-encoding`, `accept-language`)
+  or Cloudflare returns `403 Forbidden`; parse the flight result from the `1:` line. The action id is a
+  build-specific hash — refresh it with `tools/capture-subaction.mjs` (or set `MUSE_SUBSCRIPTION_ACTION_ID`)
+  after a Muse redeploy.
 - Attachments go on the hidden composer `input[type="file"]` via `setInputFiles`.
 - **Never** commit secrets: no `.muse-profile/`, no `*.har`, no tokens.
 

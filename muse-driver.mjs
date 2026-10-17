@@ -26,6 +26,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { SUBSCRIPTION_ACTION_ID, parseFlightResult } from './muse-noise.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -180,6 +181,31 @@ class MuseDriver {
     } catch (e) {
       return { status: 0, ok: false, error: String(e) }
     }
+  }
+
+  /** Usage/credits meter via the fetchSubscriptionAction RSC action, run in-page. */
+  async usage({ includeAgreement = true } = {}) {
+    const p = await this.requirePage()
+    const txt = await p.evaluate(async (args) => {
+      try {
+        const res = await fetch('/', {
+          method: 'POST',
+          headers: {
+            accept: 'text/x-component',
+            'content-type': 'text/plain;charset=UTF-8',
+            'next-action': args.id,
+          },
+          body: JSON.stringify([{ includeAgreement: args.includeAgreement }]),
+          credentials: 'same-origin',
+        })
+        const t = await res.text()
+        return { status: res.status, text: t }
+      } catch (e) { return { status: 0, text: String(e) } }
+    }, { id: SUBSCRIPTION_ACTION_ID, includeAgreement })
+    if (!txt || txt.status !== 200) throw new Error(`usage action -> ${txt && txt.status}: ${String(txt && txt.text).slice(0, 200)}`)
+    const r = parseFlightResult(txt.text)
+    if (!r || !r.success) throw new Error('usage action failed: ' + JSON.stringify((r && r.error) || r).slice(0, 200))
+    return r.subscription
   }
 
   async hasComposer() {
