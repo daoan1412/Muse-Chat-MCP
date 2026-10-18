@@ -21,7 +21,7 @@ import path from 'node:path'
 import { promises as fsp } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { accountCreds } from './muse-env.mjs'
-import { driver, MuseDriver } from './muse-driver.mjs'
+import { driver, MuseDriver, clearStaleSingleton } from './muse-driver.mjs'
 import { MuseNoiseClient } from './muse-noise.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -35,6 +35,7 @@ const log = (...a) => console.error('[muse-transport]', ...a)
 // Read login cookies from a persistent profile without keeping a browser open.
 async function grabCookies(profileDir = PROFILE_DIR) {
   const { chromium } = await import('playwright-core')
+  clearStaleSingleton(profileDir) // a killed server leaves Chrome's singleton files behind
   const ctx = await chromium.launchPersistentContext(profileDir, {
     channel: CHANNEL, headless: true, viewport: { width: 1366, height: 900 },
     args: ['--no-sandbox', '--disable-gpu', '--disable-blink-features=AutomationControlled'],

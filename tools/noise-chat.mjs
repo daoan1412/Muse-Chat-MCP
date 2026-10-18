@@ -9,6 +9,7 @@
 import '../muse-env.mjs' // .env first: muse-noise.mjs reads MUSE_* at import time
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { clearStaleSingleton } from '../muse-driver.mjs'
 import { MuseNoiseClient } from '../muse-noise.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -18,6 +19,7 @@ const ONLY_HISTORY = process.argv.includes('--history')
 
 async function getCookies() {
   const { chromium } = await import('playwright-core')
+  clearStaleSingleton(PROFILE) // a killed run leaves Chrome's singleton files behind
   const ctx = await chromium.launchPersistentContext(PROFILE, {
     channel: 'chrome', headless: true, viewport: { width: 1366, height: 900 },
     args: ['--no-sandbox', '--disable-gpu', '--disable-blink-features=AutomationControlled'],

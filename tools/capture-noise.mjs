@@ -19,6 +19,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { accountCreds } from '../muse-env.mjs'
+import { clearStaleSingleton } from '../muse-driver.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.join(__dirname, '..')
@@ -220,6 +221,7 @@ function installWsHook() {
 
 async function main() {
   const { chromium } = await import('playwright-core')
+  clearStaleSingleton(PROFILE, log) // a killed run leaves Chrome's singleton files behind
   const ctx = await chromium.launchPersistentContext(PROFILE, {
     channel: 'chrome', headless: HEADLESS, viewport: { width: 1366, height: 900 },
     acceptDownloads: false, recordHar: { path: path.join(CAP, 'muse.har'), content: 'embed', mode: 'full' },

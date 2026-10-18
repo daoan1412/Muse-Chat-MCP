@@ -59,6 +59,46 @@ const STREAM_QUIET_MS = Number(process.env.MUSE_STREAM_QUIET_MS || 600)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const log = (...a) => console.error('[muse-driver]', ...a)
 
+/**
+ * Drop Chrome's singleton files when the process that made them is gone.
+ *
+ * Chrome deletes SingletonLock/Socket/Cookie only on a clean exit, so a server
+ * that was killed (pkill, SIGKILL, a closed terminal) leaves them behind and the
+ * next launch fails with "Failed to create a ProcessSingleton". The lock is a
+ * symlink named after its owner ("<host>-<pid>"), so:
+ *   - PID alive and still a Chrome  -> a real instance owns the profile: leave it
+ *     (the CDP fallback in launch() handles that case).
+ *   - PID gone, or the PID was recycled by a non-Chrome process -> stale: unlink.
+ * Anything unreadable or ambiguous is left alone, so this never steals a live
+ * profile. Windows uses a different scheme, so it is skipped there.
+ */
+export function clearStaleSingleton(profileDir, logger = log) {
+  if (process.platform === 'win32') return false
+  let owner
+  try { owner = fs.readlinkSync(path.join(profileDir, 'SingletonLock')) } catch { return false } // no lock
+  const pid = Number(String(owner).split('-').pop())
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  let alive = true
+  try { process.kill(pid, 0) } catch (e) {
+    if (e.code === 'ESRCH') alive = false
+    else if (e.code === 'EPERM') return false // alive, owned by someone else
+  }
+  if (alive) {
+    // A recycled PID looks alive but is not Chrome: the lock is stale. If the
+    // cmdline really is Chrome, that instance owns the profile — leave it alone.
+    let cmd = ''
+    try { cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ') } catch { return false }
+    if (/chrome|chromium/i.test(cmd)) return false
+    logger(`stale singleton in ${profileDir}: pid ${pid} is alive but not Chrome ("${cmd.slice(0, 40).trim()}")`)
+  } else {
+    logger(`stale singleton in ${profileDir}: pid ${pid} is gone`)
+  }
+  for (const name of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
+    try { fs.unlinkSync(path.join(profileDir, name)) } catch {}
+  }
+  return true
+}
+
 export class MuseDriver {
   constructor(profileDir = process.env.MUSE_PROFILE_DIR || path.join(__dirname, 'accounts', 'acc1')) {
     this.profileDir = profileDir
@@ -84,8 +124,9 @@ export class MuseDriver {
     if (this.isRunning()) return this.page
     const { chromium } = await import('playwright-core')
 
-    const launchPersistent = () =>
-      chromium.launchPersistentContext(this.profileDir, {
+    const launchPersistent = async () => {
+      clearStaleSingleton(this.profileDir) // leftovers from a killed run would block this launch
+      return chromium.launchPersistentContext(this.profileDir, {
         channel: CHANNEL,
         headless: HEADLESS,
         viewport: { width: 1366, height: 900 },
@@ -98,6 +139,7 @@ export class MuseDriver {
           '--disable-features=Translate,OptimizationGuideModelDownloading',
         ],
       })
+    }
     const attachCDP = async (url) => {
       this.browser = await chromium.connectOverCDP(url)
       this.ctx = this.browser.contexts()[0] || (await this.browser.newContext())

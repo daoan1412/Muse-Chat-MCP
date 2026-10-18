@@ -23,7 +23,9 @@ See `README.md` for usage.
   account pool (`MUSE_ACCOUNTS` = bare ids → `./accounts/<id>`, or `id=path`; base `MUSE_ACCOUNTS_DIR`):
   one `MuseNoiseClient` per account, `grabCookies(profileDir)`.
 - `muse-driver.mjs` — browser driver (selectors, `_run`/`chat`/`chatStream`, `_serial`, `usage`,
-  `login` = unattended Meta sign-in via `muse-mailtemp.mjs` when creds present, else manual wait).
+  `login` = unattended Meta sign-in via `muse-mailtemp.mjs` when creds present, else manual wait);
+  `clearStaleSingleton()` unlinks Chrome's `Singleton{Lock,Socket,Cookie}` when the owning PID is
+  gone or was recycled by a non-Chrome process, so a hard-killed server does not wedge the profile.
 - `muse-mailtemp.mjs` — mailtemp.vn client for OTP-based auto-login; public API (`x-api-key`,
   `GET /api/code/{email}`) preferred, mailbox-password flow (`/api/site/unlock` → `/api/site/inbox`)
   as fallback. Normalizes messages to `{id, code, from, subject}` and exposes `waitForCode(seen)`.
