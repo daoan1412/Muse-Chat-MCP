@@ -14,22 +14,33 @@
  *   MUSE_PROMPT="hi" node tools/capture-noise.mjs
  *   MUSE_HEADLESS=0 node tools/capture-noise.mjs # watch it in a window
  */
+import '../muse-env.mjs' // credentials come from .env, never from literals in this file
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { accountCreds } from '../muse-env.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.join(__dirname, '..')
 const CAP = path.join(ROOT, 'captures')
 const PROFILE = process.env.MUSE_PROFILE_DIR || path.join(ROOT, '.muse-profile')
-const EMAIL = process.env.MUSE_META_EMAIL || ''
-const META_PASS = process.env.MUSE_META_PASSWORD || ''
-const MAIL_PASS = process.env.MUSE_MAIL_PASSWORD || ''
-const MAIL_API = 'https://mailtemp.vn/api/site'
+// MUSE_ACCOUNT_ID picks one account from the .env pool; empty = the global MUSE_* vars.
+const creds = accountCreds(process.env.MUSE_ACCOUNT_ID || '')
+const BASE = (process.env.MUSE_MAILTEMP_URL || 'https://mailtemp.vn').replace(/\/+$/, '')
+const EMAIL = process.env.MUSE_META_EMAIL || creds.email
+const META_PASS = process.env.MUSE_META_PASSWORD || creds.metaPassword
+const MAIL_PASS = process.env.MUSE_MAIL_PASSWORD || creds.mailPassword
+const MAIL_API = `${BASE}/api/site`
 const PROMPT = process.env.MUSE_PROMPT || 'Say hello in exactly three words.'
 const HEADLESS = process.env.MUSE_HEADLESS !== '0'
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const log = (...a) => console.error('[capture]', ...a)
+
+if (!EMAIL || !MAIL_PASS) {
+  console.error('capture-noise: no credentials found. Set MUSE_META_EMAIL + MUSE_MAIL_PASSWORD,')
+  console.error('or MUSE_ACCOUNT_ID=<id> with that account defined in .env — nothing is hardcoded here anymore.')
+  process.exit(1)
+}
 
 fs.mkdirSync(CAP, { recursive: true })
 fs.mkdirSync(path.join(CAP, 'js'), { recursive: true })

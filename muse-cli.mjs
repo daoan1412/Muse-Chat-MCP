@@ -21,6 +21,7 @@
  *       --base <url>        shim base url (default env MUSE_SHIM_URL or .../v1)
  *   -h, --help              show this help
  */
+import './muse-env.mjs' // .env first: the shim URL / autostart flags below come from it
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'

@@ -14,6 +14,9 @@ See `README.md` for usage.
 
 ## Map
 
+- `muse-env.mjs` — dependency-free `.env` loader (real env wins over the file) plus
+  `accountCreds(id)` for `MUSE_ACCOUNT_<ID>_*` keys. It is the only reader of credentials;
+  import it **first** in any entry point that reads `MUSE_*` at load time.
 - `muse-transport.mjs` — `MUSE_TRANSPORT` switch; facade both backends expose the same
   methods the server/shim call (`status`/`login`/`chat`/`chatStream`/`readLast`/`readChat`/`usage`/`close`),
   each taking an optional trailing `opts`/`opts.account` (browser ignores it). `NoiseTransport` is an
@@ -65,6 +68,9 @@ See `README.md` for usage.
   after a Muse redeploy.
 - Attachments go on the hidden composer `input[type="file"]` via `setInputFiles`.
 - **Never** commit secrets: no `accounts/` (Chrome/Muse profiles), no `*.har`, no tokens.
+- Credentials **never** live in code — `.env` (git-ignored) or the real environment is the
+  only source, read solely through `muse-env.mjs`. Per-account sign-in uses
+  `MUSE_ACCOUNT_<ID>_*` keys; adding an account means adding its `.env` entry, not editing a file.
 
 ### Noise-transport specifics (hard-won, do not regress)
 

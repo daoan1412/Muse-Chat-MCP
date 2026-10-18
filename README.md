@@ -84,6 +84,20 @@ export MUSE_MAIL_PASSWORD="…mailbox password…"   # or MUSE_MAILTEMP_API_KEY 
 export MUSE_META_PASSWORD="…Meta password…"       # optional
 ```
 
+Credentials live in `.env` (git-ignored), never in the code: `muse-env.mjs` loads it
+at startup, so exporting the vars yourself is only needed for a one-off override.
+With a multi-account pool, key them by account id and `muse_login` seeds each
+profile with its own address and password:
+
+```dotenv
+# .env
+MUSE_ACCOUNTS=acc1,acc2
+MUSE_ACCOUNT_ACC1_EMAIL=you@feedez.cutpro.io.vn
+MUSE_ACCOUNT_ACC1_PASSWORD=…mailbox password…
+MUSE_ACCOUNT_ACC2_EMAIL=other@feedez.cutpro.io.vn
+MUSE_ACCOUNT_ACC2_PASSWORD=…mailbox password…
+```
+
 `muse_login` prefers the mailtemp **public API** (`x-api-key`, `GET /api/code/{email}`)
 when `mail_api_key` / `MUSE_MAILTEMP_API_KEY` is set, and otherwise uses the
 **mailbox-password** flow (`POST /api/site/unlock` → `GET /api/site/inbox`). Run it
@@ -455,6 +469,13 @@ opencode, Cursor, Cline, Aider, … anything that can read files.
 | `MUSE_MAIL_PASSWORD` | – | mailtemp.vn mailbox password (site/unlock OTP flow) |
 | `MUSE_MAILTEMP_API_KEY` | – | mailtemp.vn public API key (`x-api-key`), preferred for reading OTP |
 | `MUSE_MAILTEMP_URL` | `https://mailtemp.vn` | mailtemp base URL |
+| `MUSE_ENV_FILE` | `./.env` | dotenv file loaded at startup by `muse-env.mjs` (a real env var always beats the file) |
+| `MUSE_ACCOUNT_<ID>_EMAIL` | – | per-account sign-in address, `<ID>` = an id from `MUSE_ACCOUNTS` (either case) |
+| `MUSE_ACCOUNT_<ID>_PASSWORD` | – | that account's mailtemp mailbox password — also sent as the Meta password |
+| `MUSE_ACCOUNT_<ID>_META_PASSWORD` | – | optional, overrides `…_PASSWORD` for the Meta form |
+| `MUSE_ACCOUNT_<ID>_API_KEY` | – | optional per-account `x-api-key` for reading the OTP |
+| `MUSE_ACCOUNT_<ID>_OTP_URL` | – | informational: mailbox where the code arrives (shown by `muse_status`) |
+| `MUSE_ACCOUNT_ID` | – | pick one `.env` account for `tools/capture-noise.mjs` |
 
 ---
 

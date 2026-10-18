@@ -16,9 +16,11 @@
  * the same persistent Chrome profile the browser driver uses (headless, then
  * closed) and cached for the session.
  */
+import './muse-env.mjs' // .env must land in process.env before any MUSE_* is read below
 import path from 'node:path'
 import { promises as fsp } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { accountCreds } from './muse-env.mjs'
 import { driver, MuseDriver } from './muse-driver.mjs'
 import { MuseNoiseClient } from './muse-noise.mjs'
 
@@ -139,7 +141,8 @@ class NoiseTransport {
   }
   _add(id, profileDir) {
     if (this.accounts.has(id)) return
-    this.accounts.set(id, { id, profileDir, cookies: null, client: null, viewerId: null, connecting: null, inflight: 0, q: Promise.resolve() })
+    // creds come from .env (MUSE_ACCOUNT_<ID>_*), never from literals in this file
+    this.accounts.set(id, { id, profileDir, creds: accountCreds(id), cookies: null, client: null, viewerId: null, connecting: null, inflight: 0, q: Promise.resolve() })
     this.order.push(id)
   }
   _acct(id) {
@@ -181,7 +184,7 @@ class NoiseTransport {
   async launch(opts = {}) { await this._ensure(this._acct(opts.account)); return { ok: true, transport: 'noise', accounts: this.order, defaultAccount: this.defaultId } }
   async status(opts = {}) {
     const a = this._acct(opts.account)
-      const accounts = this.order.map((id) => { const x = this.accounts.get(id); return { id: x.id, profileDir: x.profileDir, loggedIn: !!x.cookies, connected: !!(x.client && x.client.ws && x.client.ws.readyState === 1), inflight: x.inflight || 0, viewerId: x.viewerId } })
+      const accounts = this.order.map((id) => { const x = this.accounts.get(id); return { id: x.id, email: x.creds.email || null, profileDir: x.profileDir, loggedIn: !!x.cookies, connected: !!(x.client && x.client.ws && x.client.ws.readyState === 1), inflight: x.inflight || 0, viewerId: x.viewerId } })
     const connected = !!(a.client && a.client.ws && a.client.ws.readyState === 1)
     return {
       browserRunning: false, url: APP_URL, transport: 'noise',
@@ -196,12 +199,15 @@ class NoiseTransport {
     // one-shot browser sign-in (mailtemp OTP) into that profile to seed it.
     const a = this._acct(opts.account)
     if (!a.cookies) {
-      const email = opts.email || process.env.MUSE_META_EMAIL || ''
-      const hasCreds = !!(opts.metaPassword || opts.mailPassword || opts.apiKey ||
-        process.env.MUSE_META_PASSWORD || process.env.MUSE_MAIL_PASSWORD || process.env.MUSE_MAILTEMP_API_KEY)
+      const creds = a.creds
+      const email = opts.email || creds.email
+      const mailPassword = opts.mailPassword || creds.mailPassword
+      const metaPassword = opts.metaPassword || creds.metaPassword
+      const apiKey = opts.apiKey || creds.apiKey
+      const hasCreds = !!(metaPassword || mailPassword || apiKey)
       if (email && hasCreds && opts.auto !== false) {
         const d = new MuseDriver(a.profileDir)
-        try { await d.login({ ...opts, email }) }
+        try { await d.login({ ...opts, email, metaPassword, mailPassword, apiKey }) }
         catch (e) { log('noise: browser seed sign-in failed:', e.message) }
         await d.close().catch(() => {}) // release the profile lock before grabCookies()
       }
@@ -231,7 +237,7 @@ class NoiseTransport {
         }
         let committed = ''
         const r = await client.chat(prompt, {
-          timeoutMs: opts.timeoutMs || 120000,
+          timeoutMs: opts.timeoutMs || Number(process.env.MUSE_STALL_IDLE_MS || 120000), // idle gap between events (activity-based; see _chatOnce)
           attachments,
           newSession: !!(opts.newSession || opts.newThread),
           sessionId: opts.sessionId || opts.chat || null,

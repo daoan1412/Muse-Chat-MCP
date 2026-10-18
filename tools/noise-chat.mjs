@@ -6,6 +6,7 @@
 //   node tools/noise-chat.mjs                       # chat.history + a prompt
 //   node tools/noise-chat.mjs "Explain B-trees"     # custom prompt
 //   node tools/noise-chat.mjs --history             # only read history
+import '../muse-env.mjs' // .env first: muse-noise.mjs reads MUSE_* at import time
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { MuseNoiseClient } from '../muse-noise.mjs'
