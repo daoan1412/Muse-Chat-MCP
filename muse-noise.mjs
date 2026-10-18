@@ -627,15 +627,17 @@ export class MuseNoiseClient {
       ack = await this.request('POST', '/chat/stream', { body, timeoutMs: 30000 })
     }
     const events = []
-    const deadline = Date.now() + timeoutMs
+    const backstop = Date.now() + Number(process.env.MUSE_MAX_TURN_MS ?? 1800000) // absolute ceiling (max total turn)
     const stallFirst = Number(process.env.MUSE_STALL_FIRST_MS ?? 180000), stallIdle = Number(process.env.MUSE_STALL_IDLE_MS ?? 120000)
+    const idleAfterFirst = timeoutMs && timeoutMs > 0 ? timeoutMs : stallIdle // timeoutMs now = idle gap between events
     let lastEv = Date.now()
+    let idleWindow = stallFirst // sliding: tolerated silence; extends as long as events keep arriving
     let reply = '', replyReady = false, assistantMessageId = null
-    while (Date.now() < deadline) {
-      const ev = await sub.nextEvent(Math.max(50, Math.min(deadline - Date.now(), 5000)))
+    while (Date.now() < backstop) {
+      const ev = await sub.nextEvent(Math.max(50, Math.min(idleWindow - (Date.now() - lastEv), backstop - Date.now(), 5000)))
       if (ev === null) {
         if (sub.isClosed() || sub.getError()) break
-        if (Date.now() - lastEv > (events.length ? stallIdle : stallFirst)) {
+        if (Date.now() - lastEv > idleWindow) {
           sub.stop()
           const e = new Error(`stalled: no event for ${Math.round((Date.now() - lastEv) / 1000)}s (${events.length} events so far)`)
           e.stalled = true
@@ -644,6 +646,7 @@ export class MuseNoiseClient {
         continue
       }
       lastEv = Date.now()
+      idleWindow = events.length ? idleAfterFirst : stallFirst // slide the idle window on every event (don't cut off active streaming)
       events.push(ev)
       if (onEvent) onEvent(ev)
       const name = ev.event || ev.event_name

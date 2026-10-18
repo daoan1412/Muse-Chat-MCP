@@ -376,10 +376,11 @@ async function handleChat(req, res, body) {
     if (stream) {
       const w = beginStream(res); streamWriter = w; const write = w.write
       write(chunk(id, model, created, { role: 'assistant', content: '' }))
-
+      let emitted = ''
+      let r
       if (wantTools) {
         // Buffer so we can decide tool_calls vs content before emitting.
-        const r = await transport.chat(prompt, { timeoutMs, newThread, files, chat, account })
+        r = await transport.chat(prompt, { timeoutMs, newThread, files, chat, account })
         if (r.error) throw new Error(r.error)
         const calls = parseToolCalls(r.reply)
         if (calls && calls.length) {
@@ -394,8 +395,7 @@ async function handleChat(req, res, body) {
           for (let i = 0; i < s.length; i += 60) write(chunk(id, model, created, { content: s.slice(i, i + 60) }))
         }
       } else {
-        let emitted = ''
-        const r = await transport.chatStream(prompt, {
+        r = await transport.chatStream(prompt, {
           timeoutMs, newThread, files, chat, account,
           onDelta: (full) => {
             const next = full.startsWith(emitted) ? full.slice(emitted.length) : full
@@ -410,7 +410,8 @@ async function handleChat(req, res, body) {
       if (body.stream_options && body.stream_options.include_usage) {
         write(`data: ${JSON.stringify({
           id, object: 'chat.completion.chunk', created, model, choices: [],
-          usage: { prompt_tokens: approxTokens(prompt), completion_tokens: 0, total_tokens: approxTokens(prompt) },
+          ...(r.account ? { account: r.account } : {}),
+          usage: { prompt_tokens: approxTokens(prompt), completion_tokens: approxTokens(emitted), total_tokens: approxTokens(prompt) + approxTokens(emitted) },
         })}\n\n`)
       }
       write('data: [DONE]\n\n')
