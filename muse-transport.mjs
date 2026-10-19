@@ -72,8 +72,24 @@ const MIME = {
 }
 const mimeFor = (name) => MIME[String(name).toLowerCase().split('.').pop()] || 'application/octet-stream'
 
-// Read a local path or http(s) URL into bytes.
-async function readRef(ref) {
+const extFor = (mime) => Object.keys(MIME).find((k) => MIME[k] === mime) || 'bin'
+
+// Read a local path, http(s)/data: URL, or the shim's { url } / { buffer, name, mimeType } file refs into bytes.
+// `n` (1-based position in the files list) names data: URLs `attachment-<n>.<ext>` so the numbering stays visible.
+async function readRef(ref, n = 1) {
+  if (ref && typeof ref === 'object') {
+    if (ref.buffer) {
+      const buf = Buffer.isBuffer(ref.buffer) ? ref.buffer : Buffer.from(ref.buffer, 'base64')
+      return { bytes: new Uint8Array(buf), name: ref.name || `attachment-${n}`, mime: ref.mimeType }
+    }
+    ref = ref.url || ref.path || ''
+  }
+  const data = /^data:([^;,]*)(;base64)?,(.*)$/s.exec(ref)
+  if (data) {
+    const mime = data[1] || 'application/octet-stream'
+    return { bytes: new Uint8Array(Buffer.from(data[3], data[2] ? 'base64' : 'utf8')), name: `attachment-${n}.${extFor(mime)}`, mime }
+  }
+  if (/^file:\/\//i.test(ref)) ref = fileURLToPath(ref)
   if (/^https?:\/\//i.test(ref)) {
     const res = await fetch(ref)
     if (!res.ok) throw new Error(`fetch ${ref} -> ${res.status}`)
@@ -230,10 +246,10 @@ class NoiseTransport {
       const client = await this._ensure(a)
       try {
         if (!attachments.length) {
-          for (const ref of refs) {
+          for (const [i, ref] of refs.entries()) {
             try {
-              const { bytes, name } = await readRef(ref)
-              const up = await client.uploadAttachment(bytes, name, mimeFor(name))
+              const { bytes, name, mime } = await readRef(ref, i + 1)
+              const up = await client.uploadAttachment(bytes, name, mime || mimeFor(name))
               attachments.push(up)
             } catch (e) { log('attachment failed:', ref, e.message) }
           }
