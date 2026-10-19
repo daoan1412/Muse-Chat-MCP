@@ -18,9 +18,9 @@
  */
 import './muse-env.mjs' // .env must land in process.env before any MUSE_* is read below
 import path from 'node:path'
-import { promises as fsp } from 'node:fs'
+import fs, { promises as fsp } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { accountCreds } from './muse-env.mjs'
+import { accountCreds, loadDotEnv } from './muse-env.mjs'
 import { driver, MuseDriver, clearStaleSingleton } from './muse-driver.mjs'
 import { MuseNoiseClient } from './muse-noise.mjs'
 
@@ -140,32 +140,74 @@ function extractMedia(events) {
 
 class NoiseTransport {
   constructor() {
-    this.accounts = new Map() // id -> { id, profileDir, cookies, client, viewerId, connecting, q, inflight }
+    this.accounts = new Map() // id -> { id, profileDir, cookies, client, viewerId, connecting, q, inflight, downUntil }
     this.order = []
     this._rr = 0 // round-robin cursor for load balancing
-    const base = path.resolve(__dirname, process.env.MUSE_ACCOUNTS_DIR || 'accounts')
+    this.base = path.resolve(__dirname, process.env.MUSE_ACCOUNTS_DIR || 'accounts')
     const entries = (process.env.MUSE_ACCOUNTS || '').split(',').map((s) => s.trim()).filter(Boolean)
-    if (entries.length) {
-      entries.forEach((e, i) => {
-        const eq = e.indexOf('=')
-        let id, dir
-        if (eq > 0) { id = e.slice(0, eq).trim(); dir = path.resolve(__dirname, e.slice(eq + 1).trim()) }
-        else { id = e; dir = path.join(base, e) } // bare id -> <MUSE_ACCOUNTS_DIR>/<id> (default ./accounts)
-        this._add(id || `acc${i + 1}`, dir)
-      })
-    } else {
-      this._add('default', PROFILE_DIR)
-    }
+    // `*` = every profile folder under MUSE_ACCOUNTS_DIR, re-scanned while running: drop a new logged-in
+    // profile into accounts/<id> (creds in .env) and it joins the pool without a restart
+    this.scan = entries.includes('*')
+    this.scanEveryMs = Math.max(0, Number(process.env.MUSE_ACCOUNTS_RESCAN_SEC ?? 30)) * 1000
+    this.scannedAt = 0
+    entries.filter((e) => e !== '*').forEach((e, i) => {
+      const eq = e.indexOf('=')
+      let id, dir
+      if (eq > 0) { id = e.slice(0, eq).trim(); dir = path.resolve(__dirname, e.slice(eq + 1).trim()) }
+      else { id = e; dir = path.join(this.base, e) } // bare id -> <MUSE_ACCOUNTS_DIR>/<id> (default ./accounts)
+      this._add(id || `acc${i + 1}`, dir)
+    })
+    if (this.scan) this._rescan(true)
+    if (!this.order.length) this._add('default', PROFILE_DIR)
     this.defaultId = this.order[0]
   }
   _add(id, profileDir) {
     if (this.accounts.has(id)) return
     // creds come from .env (MUSE_ACCOUNT_<ID>_*), never from literals in this file
-    this.accounts.set(id, { id, profileDir, creds: accountCreds(id), cookies: null, client: null, viewerId: null, connecting: null, inflight: 0, q: Promise.resolve() })
+    this.accounts.set(id, { id, profileDir, creds: accountCreds(id), cookies: null, client: null, viewerId: null, connecting: null, inflight: 0, downUntil: 0, q: Promise.resolve() })
     this.order.push(id)
+  }
+  // Pick up profile folders added under MUSE_ACCOUNTS_DIR since the last scan (only with `*` in MUSE_ACCOUNTS).
+  // A folder counts once it is a Chrome profile (has Default/); hidden folders are skipped. Folders that vanish
+  // leave the pool (not the default account, not while a turn runs on it). Throttled to MUSE_ACCOUNTS_RESCAN_SEC (default 30).
+  _rescan(force = false) {
+    if (!this.scan) return
+    const now = Date.now()
+    if (!force && now - this.scannedAt < this.scanEveryMs) return
+    this.scannedAt = now
+    let names
+    try { names = fs.readdirSync(this.base, { withFileTypes: true }) } catch { return }
+    const dirs = new Map(names
+      .filter((d) => (d.isDirectory() || d.isSymbolicLink()) && !d.name.startsWith('.'))
+      .map((d) => [d.name, path.join(this.base, d.name)])
+      .filter(([, dir]) => fs.existsSync(path.join(dir, 'Default'))))
+    const real = (dir) => { try { return fs.realpathSync(dir) } catch { return dir } }
+    const known = new Set([...this.accounts.values()].map((a) => real(a.profileDir))) // same folder under two names = one account
+    const added = []
+    for (const [id, dir] of [...dirs].sort(([x], [y]) => x.localeCompare(y))) {
+      if (this.accounts.has(id) || known.has(real(dir))) continue
+      if (!added.length && this.defaultId) { // after start: re-read .env for creds added since
+        loadDotEnv(undefined, { refresh: true })
+        for (const a of this.accounts.values()) a.creds = accountCreds(a.id)
+      }
+      this._add(id, dir)
+      added.push(id)
+    }
+    const gone = this.order.filter((id) => {
+      const a = this.accounts.get(id)
+      return id !== this.defaultId && !(a.inflight > 0) && path.dirname(a.profileDir) === this.base && !dirs.has(path.basename(a.profileDir))
+    })
+    for (const id of gone) {
+      const a = this.accounts.get(id)
+      try { a.client?.close() } catch {}
+      this.accounts.delete(id)
+    }
+    if (gone.length) this.order = this.order.filter((id) => this.accounts.has(id))
+    if (this.defaultId && (added.length || gone.length)) log('accounts rescan: +', added.join(',') || '-', ' -', gone.join(',') || '-', '→', this.order.length)
   }
   _acct(id) {
     id = id || this.defaultId
+    if (!this.accounts.has(id)) this._rescan(true) // a just-added profile named explicitly
     const a = this.accounts.get(id)
     if (!a) throw new Error(`unknown account "${id}" (known: ${this.order.join(', ')})`)
     return a
@@ -301,6 +343,14 @@ class NoiseTransport {
   // Ordered candidate accounts for a request that did NOT name one.
   // MUSE_ACCOUNT_LB: round_robin (default when >1 account) | least_conn | first|none (pin default).
   _lbCandidates(opts = {}) {
+    this._rescan()
+    const ranked = this._lbOrder()
+    // an account that just failed (not logged in, rate-limited, mid-login) goes last until its cooldown ends,
+    // so a broken profile does not cost every request a Chromium launch
+    const now = Date.now()
+    return [...ranked.filter((a) => !(a.downUntil > now)), ...ranked.filter((a) => a.downUntil > now)]
+  }
+  _lbOrder() {
     const n = this.order.length
     if (n <= 1) return [this._acct()]
     const mode = (process.env.MUSE_ACCOUNT_LB || 'round_robin').toLowerCase()
@@ -316,7 +366,14 @@ class NoiseTransport {
     let last
     for (const a of cands) {
       try { return await this._turn(a, prompt, opts) }
-      catch (e) { last = e; log('LB failover from', a.id, ':', e && e.message) }
+      catch (e) {
+        last = e
+        log('LB failover from', a.id, ':', e && e.message)
+        if (cands.length > 1) {
+          a.downUntil = Date.now() + Math.max(0, Number(process.env.MUSE_ACCOUNT_COOLDOWN_SEC ?? 60)) * 1000
+          a.cookies = null // re-read the profile after the cooldown (it may have been signed in meanwhile)
+        }
+      }
     }
     throw last
   }

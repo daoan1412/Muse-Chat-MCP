@@ -27,14 +27,16 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ENV_FILE = process.env.MUSE_ENV_FILE || path.join(__dirname, '.env')
 
 let loaded = false
+const fileKeys = new Set() // keys this loader set from the file (a refresh may update them; real env stays untouched)
 
 /**
  * Parse .env into process.env. Values already present in the real environment
  * are left untouched; quoted values are unwrapped, unquoted ones may carry a
- * trailing `# comment`.
+ * trailing `# comment`. `{ refresh: true }` re-reads the file so accounts added
+ * to .env while the server runs get their credentials without a restart.
  */
-export function loadDotEnv(file = ENV_FILE) {
-  if (loaded) return process.env
+export function loadDotEnv(file = ENV_FILE, { refresh = false } = {}) {
+  if (loaded && !refresh) return process.env
   loaded = true
   let text
   try { text = fs.readFileSync(file, 'utf8') } catch { return process.env } // no .env -> pure env mode
@@ -45,7 +47,7 @@ export function loadDotEnv(file = ENV_FILE) {
     if (eq < 0) continue
     const key = line.slice(0, eq).trim().replace(/^export\s+/, '')
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue
-    if (process.env[key] !== undefined) continue // shell wins
+    if (process.env[key] !== undefined && !fileKeys.has(key)) continue // shell wins
     let value = line.slice(eq + 1).trim()
     const q = value[0]
     if ((q === '"' || q === "'") && value.endsWith(q) && value.length > 1) value = value.slice(1, -1)
@@ -54,6 +56,7 @@ export function loadDotEnv(file = ENV_FILE) {
       if (hash > 0) value = value.slice(0, hash).trim()
     }
     process.env[key] = value
+    fileKeys.add(key)
   }
   return process.env
 }

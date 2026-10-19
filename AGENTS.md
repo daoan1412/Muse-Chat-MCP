@@ -20,7 +20,8 @@ See `README.md` for usage.
 - `muse-transport.mjs` — `MUSE_TRANSPORT` switch; facade both backends expose the same
   methods the server/shim call (`status`/`login`/`chat`/`chatStream`/`readLast`/`readChat`/`usage`/`close`),
   each taking an optional trailing `opts`/`opts.account` (browser ignores it). `NoiseTransport` is an
-  account pool (`MUSE_ACCOUNTS` = bare ids → `./accounts/<id>`, or `id=path`; base `MUSE_ACCOUNTS_DIR`):
+  account pool (`MUSE_ACCOUNTS` = bare ids → `./accounts/<id>`, or `id=path`, or `*` = every profile folder of
+  `MUSE_ACCOUNTS_DIR`, re-scanned at most every `MUSE_ACCOUNTS_RESCAN_SEC` by `_rescan`; base `MUSE_ACCOUNTS_DIR`):
   one `MuseNoiseClient` per account, `grabCookies(profileDir)`.
 - `muse-driver.mjs` — browser driver (selectors, `_run`/`chat`/`chatStream`, `_serial`, `usage`,
   `login` = unattended Meta sign-in via `muse-mailtemp.mjs` when creds present, else manual wait);
