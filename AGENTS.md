@@ -115,8 +115,8 @@ See `README.md` for usage.
 ## Verify changes
 
 ```bash
-npm run selftest                                   # browser transport (default)
-MUSE_TRANSPORT=noise npm run selftest              # noise transport (headless)
+pnpm selftest                                   # browser transport (default)
+MUSE_TRANSPORT=noise pnpm selftest              # noise transport (headless)
 node muse-cli.mjs "Say hello in three words."      # CLI over the shim
 MUSE_TRANSPORT=noise node tools/noise-chat.mjs     # headless client e2e
 ```

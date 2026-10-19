@@ -125,11 +125,11 @@
 
 <section id="quickstart" class="wrap">
   <h2>Quickstart</h2>
-  <p class="lead">Prerequisites: Node.js&nbsp;≥&nbsp;18, Google Chrome, and a Meta account with access to Muse.</p>
+  <p class="lead">Prerequisites: Node.js&nbsp;≥&nbsp;22.13 + pnpm (<code>corepack enable pnpm</code>), Google Chrome, and a Meta account with access to Muse.</p>
   <pre><button class="copy">copy</button>git clone https://github.com/duclm1x1/Muse-Chat-MCP.git
 cd Muse-Chat-MCP
-npm install
-npm run selftest   # opens Chrome to muse.ai — sign in once; the session is saved</pre>
+pnpm install
+pnpm selftest   # opens Chrome to muse.ai — sign in once; the session is saved</pre>
   <p class="lead">Then wire it into a client:</p>
   <pre><button class="copy">copy</button># MCP (stdio)
 node /absolute/path/to/Muse-Chat-MCP/muse-server.mjs

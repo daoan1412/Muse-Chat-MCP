@@ -37,7 +37,8 @@ Plus a tiny **CLI** (`muse-cli.mjs`) for one-shot generation from scripts.
 
 ## Requirements
 
-- **Node.js ≥ 18** (tested on v24).
+- **Node.js ≥ 22.13** (tested on v24; pnpm 11 needs 22.13+).
+- **pnpm** — run `corepack enable pnpm` once, or `npm i -g pnpm@11.28.5`.
 - **Google Chrome** (or Edge) installed.
 - A **Meta account** with access to Muse.
 - Windows / macOS / Linux (paths in the examples are Windows; adjust for your OS).
@@ -49,15 +50,15 @@ Plus a tiny **CLI** (`muse-cli.mjs`) for one-shot generation from scripts.
 ```bash
 git clone https://github.com/duclm1x1/Muse-Chat-MCP.git
 cd Muse-Chat-MCP
-npm install
+pnpm install
 ```
 
-`npm install` only pulls `playwright-core` (a library) — it does **not** download a browser.
+`pnpm install` only pulls `playwright-core` (a library) — it does **not** download a browser.
 
 ## First run (log in once)
 
 ```bash
-npm run selftest          # launches Chrome, prints login/browser state, then closes
+pnpm selftest              # launches Chrome, prints login/browser state, then closes
 ```
 
 A Chrome window opens to `https://muse.ai`. Sign in with your Meta account. The session is stored in a dedicated profile (`accounts/acc1/`, git-ignored) and reused afterwards. When `muse_status` reports `"loggedIn": true`, you're ready.
@@ -78,7 +79,7 @@ completes the "remember this device" step automatically:
 ```
 
 ```bash
-# or via env, then just call muse_login / npm run selftest with no args
+# or via env, then just call muse_login / pnpm selftest with no args
 export MUSE_META_EMAIL="you@feedez.cutpro.io.vn"
 export MUSE_MAIL_PASSWORD="…mailbox password…"   # or MUSE_MAILTEMP_API_KEY for the public API
 export MUSE_META_PASSWORD="…Meta password…"       # optional
@@ -341,7 +342,7 @@ node muse-cli.mjs --usage                                                     # 
 node muse-cli.mjs --new-thread "Solve 2x^2 - 5x + 3 = 0"                      # fresh side chat (isolated; parallel-safe over noise)
 node muse-cli.mjs --json-schema ./schema.json "Extract name and age from this bio"   # force schema-valid JSON (implies --no-stream)
 echo "<file contents>" | node muse-cli.mjs -s "Review this file"              # prompt from stdin
-npm run muse -- "hello"                                                       # via package.json
+pnpm muse -- "hello"                                                          # via package.json
 ```
 
 Options: `-s/--system <text>`, `-m/--model <id>` (default `muse-spark-1.3`), `-t/--timeout <ms>` (default 180000), `-f/--file/--image <path|url>` (repeatable), `--chat <name|index|url>`, `--list-chats`, `--query <text>`, `--read [<chat>]`, `--media [<chat>]`, `--download`, `--dir <dir>`, `--usage`, `--new-thread`, `--no-stream`, `--json`, `--json-schema <inline|file>`, `--base <url>` (or env `MUSE_SHIM_URL`), `-h/--help`.
@@ -486,14 +487,14 @@ handshake itself (`Noise_XX_25519_AESGCM_SHA256`), speaks the protobuf RPC frami
 and reads the reply from the `chat.subscribe` event stream — no browser, no DOM.
 
 ```bash
-MUSE_TRANSPORT=noise npm run selftest              # connect + status, headless
+MUSE_TRANSPORT=noise pnpm selftest                  # connect + status, headless
 MUSE_TRANSPORT=noise node muse-server.mjs          # MCP server over noise
 MUSE_TRANSPORT=noise node muse-cli.mjs "hi"        # CLI over the noise shim
 ```
 
 It still needs your login: the cookies are read once from the same `accounts/acc1`
 (headless, then closed) and reused for the session, so **log in with the browser
-transport first** (`npm run selftest`), then switch to `noise`.
+transport first** (`pnpm selftest`), then switch to `noise`.
 
 Over `noise` the core tools work (`muse_status`, `muse_chat`, `muse_read_last`,
 `muse_read_chat`, `muse_chats`, `muse_media`, `muse_usage`, plus the shim
@@ -507,7 +508,7 @@ single active session) and `muse_dump_dom` (no DOM).
 
 ## Troubleshooting
 
-- **`loggedIn: false`** → run `muse_login` (or `npm run selftest`) and sign in in the Chrome window.
+- **`loggedIn: false`** → run `muse_login` (or `pnpm selftest`) and sign in in the Chrome window.
 - **`composerReady: false`** after login → `node muse-server.mjs --dump-dom`; if the DOM changed, re-derive selectors and update `SELECTORS` in `muse-driver.mjs`.
 - **Empty reply / `timedOut`** → raise `timeout_sec`; agent tasks (browsing, VM work) can take minutes. `needsApproval: true` means Muse is waiting on an in-app approval you must click.
 - **Chrome profile locked** → expected if a Chrome already uses `accounts/acc1`. The driver auto-attaches to `http://127.0.0.1:9222` in that case; otherwise close that window, or start Chrome with `--remote-debugging-port=9222` and set `MUSE_CDP`.

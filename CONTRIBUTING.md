@@ -7,8 +7,8 @@ Thanks for helping! This project automates a real browser, so a few invariants m
 ```bash
 git clone https://github.com/duclm1x1/Muse-Chat-MCP.git
 cd Muse-Chat-MCP
-npm install
-npm run selftest        # log in to Muse once
+pnpm install
+pnpm selftest        # log in to Muse once
 node muse-cli.mjs "Say hello in three words."
 ```
 
@@ -34,7 +34,7 @@ node muse-cli.mjs "Say hello in three words."
 ## Verify
 
 ```bash
-npm run selftest                      # browser + login + composer
+pnpm selftest                      # browser + login + composer
 node muse-cli.mjs "Hi in 3 words."    # end-to-end through the shim
 ```
 

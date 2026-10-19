@@ -1,6 +1,7 @@
 {
   "name": "muse-chat-mcp",
   "version": "0.1.0",
+  "packageManager": "pnpm@11.28.5",
   "type": "module",
   "description": "MCP server + OpenAI-compatible HTTP shim that let any MCP or OpenAI client use Meta Muse (muse.ai, the \"Hatch\" agent) by driving your real, logged-in Chrome.",
   "keywords": [
@@ -38,7 +39,7 @@
     "dump": "node muse-server.mjs --dump-dom"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22.13.0"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.31.0",
