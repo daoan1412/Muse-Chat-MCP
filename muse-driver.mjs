@@ -50,6 +50,8 @@ const PROFILE_DIR =
   process.env.MUSE_PROFILE_DIR || path.join(__dirname, 'accounts', 'acc1')
 const HEADLESS = process.env.MUSE_HEADLESS === '1'
 const CHANNEL = process.env.MUSE_CHANNEL || 'chrome'
+// MUSE_CHROME_PATH: launch this browser binary instead of the installed Chrome channel (e.g. Playwright's cached Chromium).
+const CHROME_PATH = process.env.MUSE_CHROME_PATH || ''
 const LAUNCH_TIMEOUT = Number(process.env.MUSE_LAUNCH_TIMEOUT_MS || 60000)
 // Streaming: only surface text that has been stable this long, so we never emit
 // a mid-generation "skeleton" that Muse later rewrites (which would duplicate in
@@ -127,7 +129,7 @@ export class MuseDriver {
     const launchPersistent = async () => {
       clearStaleSingleton(this.profileDir) // leftovers from a killed run would block this launch
       return chromium.launchPersistentContext(this.profileDir, {
-        channel: CHANNEL,
+        ...(CHROME_PATH ? { executablePath: CHROME_PATH } : { channel: CHANNEL }),
         headless: HEADLESS,
         viewport: { width: 1366, height: 900 },
         acceptDownloads: false,

@@ -223,7 +223,7 @@ async function main() {
   const { chromium } = await import('playwright-core')
   clearStaleSingleton(PROFILE, log) // a killed run leaves Chrome's singleton files behind
   const ctx = await chromium.launchPersistentContext(PROFILE, {
-    channel: 'chrome', headless: HEADLESS, viewport: { width: 1366, height: 900 },
+    ...(process.env.MUSE_CHROME_PATH ? { executablePath: process.env.MUSE_CHROME_PATH } : { channel: 'chrome' }), headless: HEADLESS, viewport: { width: 1366, height: 900 },
     acceptDownloads: false, recordHar: { path: path.join(CAP, 'muse.har'), content: 'embed', mode: 'full' },
     args: ['--no-sandbox', '--disable-gpu', '--no-first-run', '--disable-blink-features=AutomationControlled'],
   })

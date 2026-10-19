@@ -450,6 +450,7 @@ opencode, Cursor, Cline, Aider, … anything that can read files.
 | `MUSE_PROFILE_DIR` | `./accounts/acc1` | dedicated Chrome profile (holds your login) |
 | `MUSE_URL` | `https://muse.ai/` | app URL |
 | `MUSE_CHANNEL` | `chrome` | `chrome` or `msedge` |
+| `MUSE_CHROME_PATH` | – | browser binary to launch instead of `MUSE_CHANNEL` (e.g. Playwright's cached Chromium) |
 | `MUSE_HEADLESS=1` | off | run headless (log in headed first) |
 | `MUSE_CDP` | – | attach to an existing Chrome at this URL (e.g. `http://127.0.0.1:9222`) instead of launching |
 | `MUSE_STREAM_QUIET_MS` | `600` | streaming stability window (skip mid-message draft rewrites) |

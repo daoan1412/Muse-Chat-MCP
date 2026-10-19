@@ -28,6 +28,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PROFILE_DIR = process.env.MUSE_PROFILE_DIR || path.join(__dirname, 'accounts', 'acc1')
 const APP_URL = process.env.MUSE_URL || 'https://muse.ai/'
 const CHANNEL = process.env.MUSE_CHANNEL || 'chrome'
+// MUSE_CHROME_PATH: launch this browser binary instead of the installed Chrome channel (e.g. Playwright's cached Chromium).
+const CHROME_PATH = process.env.MUSE_CHROME_PATH || ''
 const TRANSPORT = (process.env.MUSE_TRANSPORT || 'browser').toLowerCase()
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const log = (...a) => console.error('[muse-transport]', ...a)
@@ -37,7 +39,7 @@ async function grabCookies(profileDir = PROFILE_DIR) {
   const { chromium } = await import('playwright-core')
   clearStaleSingleton(profileDir) // a killed server leaves Chrome's singleton files behind
   const ctx = await chromium.launchPersistentContext(profileDir, {
-    channel: CHANNEL, headless: true, viewport: { width: 1366, height: 900 },
+    ...(CHROME_PATH ? { executablePath: CHROME_PATH } : { channel: CHANNEL }), headless: true, viewport: { width: 1366, height: 900 },
     args: ['--no-sandbox', '--disable-gpu', '--disable-blink-features=AutomationControlled'],
   })
   try {
