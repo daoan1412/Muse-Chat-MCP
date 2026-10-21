@@ -466,6 +466,7 @@ opencode, Cursor, Cline, Aider, … anything that can read files.
 | `MUSE_ACCOUNTS_DIR` | `./accounts` | base folder for bare-id accounts in `MUSE_ACCOUNTS` (all profiles live here) |
 | `MUSE_ACCOUNT_LB` | `round_robin` | load balancing for requests that do NOT name an account (noise, >1 account): `round_robin` \| `least_conn` \| `first`/`none` (pin default). An explicit `x-muse-account`/`account` always overrides LB; a dead/rate-limited account fails over to the next |
 | `MUSE_SHIM_URL` | `http://127.0.0.1:8787/v1` | shim base url used by the CLI |
+| `MUSE_DEBUG_WS=1` | off | (noise) log every raw WebSocket frame length — ~100 lines/s while a reply streams |
 | `MUSE_CLI_AUTOSTART=0` | off | disable the CLI auto-starting a shim |
 | `MUSE_SUBSCRIPTION_ACTION_ID` | `4029ac5c…` | RSC action id for `muse_usage` (refresh after a Muse redeploy) |
 | `MUSE_META_EMAIL` | – | temp-mail address for unattended `muse_login` (mailtemp.vn) |

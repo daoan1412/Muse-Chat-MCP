@@ -22,7 +22,7 @@ import fs, { promises as fsp } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { accountCreds, loadDotEnv } from './muse-env.mjs'
 import { driver, MuseDriver, clearStaleSingleton } from './muse-driver.mjs'
-import { MuseNoiseClient } from './muse-noise.mjs'
+import { MuseNoiseClient, abortedError } from './muse-noise.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PROFILE_DIR = process.env.MUSE_PROFILE_DIR || path.join(__dirname, 'accounts', 'acc1')
@@ -284,11 +284,14 @@ class NoiseTransport {
     const onDelta = opts.onDelta
     const refs = opts.files || []
     const attachments = []
+    const signal = opts.signal || null
     for (let attempt = 0; attempt < 2; attempt++) {
+      if (signal && signal.aborted) throw abortedError()
       const client = await this._ensure(a)
       try {
         if (!attachments.length) {
           for (const [i, ref] of refs.entries()) {
+            if (signal && signal.aborted) throw abortedError()
             try {
               const { bytes, name, mime } = await readRef(ref, i + 1)
               const up = await client.uploadAttachment(bytes, name, mime || mimeFor(name))
@@ -302,6 +305,7 @@ class NoiseTransport {
           attachments,
           newSession: !!(opts.newSession || opts.newThread),
           sessionId: opts.sessionId || opts.chat || null,
+          signal,
           onEvent: (ev) => {
             if (!onDelta) return
             if ((ev.event || ev.event_name) === 'delta.text_append' && typeof ev.payload?.text === 'string') {
@@ -322,7 +326,7 @@ class NoiseTransport {
           ...(r.replyReady ? {} : { timedOut: true }),
         }
       } catch (e) {
-        if (e.noRetry) throw e // Muse itself reported an error: return it to the caller as-is
+        if (e.noRetry || e.aborted) throw e // Muse itself reported an error (or the caller left): return it as-is
         log('chat attempt', attempt, 'failed:', e.message)
         try { a.client?.close() } catch {}
         a.client = null // keep cookies; force a fresh connection on retry
@@ -367,6 +371,7 @@ class NoiseTransport {
     for (const a of cands) {
       try { return await this._turn(a, prompt, opts) }
       catch (e) {
+        if (e.aborted) throw e // the caller is gone: no failover, and the account did nothing wrong
         last = e
         log('LB failover from', a.id, ':', e && e.message)
         if (cands.length > 1) {

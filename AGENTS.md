@@ -99,6 +99,11 @@ See `README.md` for usage.
 - Generated media lives in `delta.presentation` events (live AND in `chat.history`):
   `payload.data.{images,videos,files}[]` each `{path:"sandbox://workspace/…", mime, label}`;
   download with `GET /fs/raw/workspace/<path>` (binary).
+- Cancel = `POST /chat/cancel` `{session_id}` for a side thread, `{}` for the primary session
+  → `{cancelled, message_id}`; Muse then ends the turn with `delta.message_done` (the composer's stop
+  button). The shim aborts a request whose client hung up (`res` closed before it finished): the
+  `signal` reaches `_chatOnce`, which sends `chat.cancel`, and the abort skips `chat` retries,
+  LB failover, the account cooldown and schema retries.
 - `list_chats` = `GET /api/session/list` → `result.sessions[]` (`title`, `session_id`,
   `is_primary`, `snippet`, `pinned`). `open_chat`/`dump_dom` stay browser-only.
 - Concurrency: reads (`list_chats`/`chat_media`/`history`/`fs`) multiplex safely on one

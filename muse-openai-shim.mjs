@@ -339,6 +339,11 @@ async function handleChat(req, res, body) {
   }
 
   let streamWriter = null
+  // The caller hung up before we answered (client timeout, cancelled job, restarted app):
+  // abort so the transport stops the Muse turn instead of running it — and its retries — for nobody.
+  const ac = new AbortController()
+  res.on('close', () => { if (!res.writableFinished) ac.abort() })
+  const signal = ac.signal
 
   log(`chat model=${model} stream=${stream} tools=${wantTools} files=${files.length} target=${chat !== undefined ? chat : 'current'} account=${account || 'auto'} promptChars=${prompt.length}`)
 
@@ -349,7 +354,7 @@ async function handleChat(req, res, body) {
         try { validate = compileValidator(rfInfo.schema) }
         catch (e) { return sendError(res, 400, `Invalid JSON Schema: ${e.message}`, 'invalid_request_error', null, 'response_format') }
       }
-      const out = await runStructured(prompt, rfInfo, validate, { timeoutMs, newThread, files, chat, account })
+      const out = await runStructured(prompt, rfInfo, validate, { timeoutMs, newThread, files, chat, account, signal })
       const jsonStr = JSON.stringify(out.obj)
       if (stream) {
         const w = beginStream(res); streamWriter = w; const write = w.write
@@ -380,7 +385,7 @@ async function handleChat(req, res, body) {
       let r
       if (wantTools) {
         // Buffer so we can decide tool_calls vs content before emitting.
-        r = await transport.chat(prompt, { timeoutMs, newThread, files, chat, account })
+        r = await transport.chat(prompt, { timeoutMs, newThread, files, chat, account, signal })
         if (r.error) throw new Error(r.error)
         const calls = parseToolCalls(r.reply)
         if (calls && calls.length) {
@@ -396,7 +401,7 @@ async function handleChat(req, res, body) {
         }
       } else {
         r = await transport.chatStream(prompt, {
-          timeoutMs, newThread, files, chat, account,
+          timeoutMs, newThread, files, chat, account, signal,
           onDelta: (full) => {
             const next = full.startsWith(emitted) ? full.slice(emitted.length) : full
             emitted = full
@@ -420,7 +425,7 @@ async function handleChat(req, res, body) {
     }
 
     // Non-streaming
-    const r = await transport.chat(prompt, { timeoutMs, newThread, files, chat, account })
+    const r = await transport.chat(prompt, { timeoutMs, newThread, files, chat, account, signal })
     if (r.error && !r.reply) throw new Error(r.error)
     const calls = wantTools ? parseToolCalls(r.reply) : null
 
@@ -440,6 +445,7 @@ async function handleChat(req, res, body) {
       },
     }))
   } catch (err) {
+    if (signal.aborted) { log('client disconnected after', Math.round((Date.now() - created * 1000) / 1000), 's — turn cancelled'); return }
     log('error:', err && err.message)
     let msg = `Muse error: ${err && err.message ? err.message : String(err)}`
     if (err && err.detail && Array.isArray(err.detail.errors)) msg += ` (last attempt: ${err.detail.errors.slice(0, 6).join('; ')})`

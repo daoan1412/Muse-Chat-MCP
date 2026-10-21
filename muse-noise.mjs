@@ -603,6 +603,7 @@ export class MuseNoiseClient {
     for (let attempt = 0; ; attempt++) {
       try { return await this._chatOnce(prompt, opts) }
       catch (e) {
+        if (e.aborted) throw e
         const retryable = e.stalled || /^request timeout POST \/chat\/stream/.test(e.message || '')
         if (!retryable) throw e
         // an ack timeout on a reused session may have been delivered: only auto-retry fresh sessions or stalls before any event
@@ -612,7 +613,17 @@ export class MuseNoiseClient {
       }
     }
   }
-  async _chatOnce(prompt, { nodeId = crypto.randomUUID(), timeoutMs = 120000, onEvent, attachments = [], sessionId = null, newSession = false } = {}) {
+  // Stop the turn running on Muse (the composer's stop button). Body = {session_id} for a side thread,
+  // {} for the primary session; the reply is {cancelled: bool}.
+  async cancel(sessionId = null) {
+    const r = await this.request('POST', '/chat/cancel', { body: sessionId ? { session_id: sessionId } : {}, timeoutMs: 15000 })
+    let json = null
+    try { json = JSON.parse(r.body.toString('utf8')) } catch {}
+    if (r.status !== 200) throw new Error(`chat.cancel ${r.status}: ${r.body.toString('utf8').slice(0, 200)}`)
+    return !!(json && (json.cancelled ?? (json.result && json.result.cancelled)))
+  }
+  async _chatOnce(prompt, { nodeId = crypto.randomUUID(), timeoutMs = 120000, onEvent, attachments = [], sessionId = null, newSession = false, signal = null } = {}) {
+    if (signal && signal.aborted) throw abortedError()
     let text = prompt
     for (const a of attachments) { const alt = String(a.name || '').replace(/[\]\[]/g, ''); text += `\n![${alt}](${a.uri})` }
     const sid = newSession ? crypto.randomUUID() : sessionId
@@ -634,6 +645,13 @@ export class MuseNoiseClient {
     let idleWindow = stallFirst // sliding: tolerated silence; extends as long as events keep arriving
     let reply = '', replyReady = false, assistantMessageId = null
     while (Date.now() < backstop) {
+      if (signal && signal.aborted) {
+        // caller is gone: stop Muse generating instead of letting it burn quota to the end
+        sub.stop()
+        const cancelled = await this.cancel(sid).catch((e) => { this.log('chat.cancel failed:', e.message); return false })
+        this.log('turn aborted by caller; chat.cancel', sid || 'primary', '→', cancelled)
+        throw abortedError()
+      }
       const ev = await sub.nextEvent(Math.max(50, Math.min(idleWindow - (Date.now() - lastEv), backstop - Date.now(), 5000)))
       if (ev === null) {
         if (sub.isClosed() || sub.getError()) break
@@ -672,9 +690,10 @@ export class MuseNoiseClient {
 function _frameReader(ws, log = () => {}) {
   const q = []
   let resolveNext = null, closed = false
+  const debugFrames = process.env.MUSE_DEBUG_WS === '1' // per-frame trace: ~100 lines/s while a reply streams
   ws.on('message', (data) => {
     const buf = Buffer.isBuffer(data) ? new Uint8Array(data) : new Uint8Array(data)
-    log('WS msg len', buf.length)
+    if (debugFrames) log('WS msg len', buf.length)
     if (resolveNext) { const r = resolveNext; resolveNext = null; r(buf) }
     else q.push(buf)
   })
@@ -718,6 +737,12 @@ export function museSorryError(text, sessionId) {
   e.noRetry = true
   e.museError = true
   if (sessionId) e.sessionId = sessionId
+  return e
+}
+export function abortedError() {
+  const e = new Error('aborted: client disconnected')
+  e.aborted = true
+  e.noRetry = true
   return e
 }
 function sessionIdReused(opts) { return !!opts.sessionId }
