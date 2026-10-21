@@ -284,6 +284,17 @@ class NoiseTransport {
     }
     return streamId
   }
+  // Client-side stream reset (like HTTP/2 RST_STREAM): the gateway caps a connection at ~256 open streams and
+  // never ends a /chat/subscribe on its own, so a finished turn must reset its feed or the slot leaks until the
+  // gateway answers `reset code=3 too many concurrent streams` and drops the whole connection. Code 8 = cancel.
+  async resetStream(streamId, code = 8) {
+    const frame = encodeMessage({ stream_id: streamId, reset: { code, reason: new Uint8Array(0) } }, S_FRAME)
+    const h = encodeMessage({ service: 0, payload: frame }, S_SREQ)
+    for (const c of chunkMessage(h)) {
+      const ct = await this.c1.encrypt(new Uint8Array(0), c)
+      this.ws.send(ct)
+    }
+  }
   // decrypt one wire frame -> NoiseTransportFrame, reassemble by chunk_id.
   async feedFrame(bytes) {
     const pt = await this.c2.decrypt(new Uint8Array(0), bytes)
@@ -451,6 +462,12 @@ export class MuseNoiseClient {
       for (const [, h] of this.handlers) { try { h.onEnd && h.onEnd() } catch {} }
     })()
   }
+  // Reset a stream we no longer read (best effort: a dead connection already freed it).
+  _reset(streamId) {
+    const t = this.transport
+    if (!t || !t.ws || t.ws.readyState !== 1) return
+    t.resetStream(streamId).catch((e) => this.log('reset error:', e.message))
+  }
   // Allocate a stream, send the request frame (fire-and-forget), return the stream id.
   _send(method, path, bodyObj, { service = 0, headers = [] } = {}) {
     const streamId = this.transport.allocStream()
@@ -483,7 +500,7 @@ export class MuseNoiseClient {
         if (err) reject(err)
         else resolve({ status, headers: respHeaders, body: Buffer.from(concat(...(bodyParts.length ? bodyParts : [new Uint8Array(0)]))) })
       }
-      const timer = setTimeout(() => finish(new Error(`request timeout ${method} ${path}`)), timeoutMs)
+      const timer = setTimeout(() => { this._reset(streamId); finish(new Error(`request timeout ${method} ${path}`)) }, timeoutMs)
       this.handlers.set(key, {
         onFrame: (frame) => {
           const kind = frame.kind
@@ -588,7 +605,11 @@ export class MuseNoiseClient {
           if (timeoutMs) setTimeout(() => { if (notify === done) done() }, timeoutMs)
         })
       },
-      stop: () => { this.handlers.delete(key); if (this._settled.size > 1000) this._settled.clear(); this._settled.add(key) },
+      stop: () => {
+        if (!this.handlers.has(key)) return
+        this.handlers.delete(key); if (this._settled.size > 1000) this._settled.clear(); this._settled.add(key)
+        if (!state.closed) this._reset(streamId)
+      },
     }
   }
   // Full turn. newSession=true creates a brand-new side chat (thread): we send
@@ -635,7 +656,7 @@ export class MuseNoiseClient {
       sub = this.chatSubscribe({ sessionId: sid })
     } else {
       sub = this.chatSubscribe({ sessionId: sid })
-      ack = await this.request('POST', '/chat/stream', { body, timeoutMs: 30000 })
+      try { ack = await this.request('POST', '/chat/stream', { body, timeoutMs: 30000 }) } catch (e) { sub.stop(); throw e }
     }
     const events = []
     const backstop = Date.now() + Number(process.env.MUSE_MAX_TURN_MS ?? 1800000) // absolute ceiling (max total turn)

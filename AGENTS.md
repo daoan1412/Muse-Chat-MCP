@@ -111,6 +111,12 @@ See `README.md` for usage.
   active session does NOT — every turn subscribes to the same feed and cross-contaminates,
   so the facade serializes those via `_serial` (like the browser driver); `ensure()`
   reconnects when the WS is no longer OPEN and `_run` retries once on a dead-connection error.
+- Stream cap: the gateway allows ~256 open streams per connection (the 258th gets
+  `reset code=3 too many concurrent streams` and the connection drops with 1006). A
+  `chat.subscribe` never ends on its own, so the client closes it with a frame
+  `{stream_id, reset:{code:8}}` (`resetStream`, like HTTP/2 RST_STREAM) — sent by the feed's
+  `stop()`, on a request timeout, and when the ack fails after subscribing. Without it every turn
+  leaks one stream and a busy account loses its connection every ~256 turns.
 - New side chat per request (`new_thread` / `x-muse-thread: new` / `opts.newSession`):
   generate a fresh `session_id` (uuid), `chat.stream` FIRST (server materializes the thread,
   `is_thread:true`), THEN `chat.subscribe` with that `session_id` — the reverse order yields
