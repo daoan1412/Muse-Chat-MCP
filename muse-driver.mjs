@@ -393,16 +393,23 @@ export class MuseDriver {
     const metaPassword = opts.metaPassword || process.env.MUSE_META_PASSWORD || ''
     const mailPassword = opts.mailPassword || process.env.MUSE_MAIL_PASSWORD || ''
     const apiKey = opts.apiKey || process.env.MUSE_MAILTEMP_API_KEY || ''
-    const auto = opts.auto !== false && !!email && !!(metaPassword || mailPassword || apiKey)
+    const otpUrl = opts.otpUrl || process.env.MUSE_META_OTP_URL || ''
+    const { isGeneratorEmailUrl } = await import('./muse-genmail.mjs')
+    const genmail = isGeneratorEmailUrl(otpUrl)
+    const auto = opts.auto !== false && !!email && !!(metaPassword || mailPassword || apiKey || genmail)
 
     const p = await this.gotoApp()
     let auth = await this.checkAuth()
     if (auth.ok) return { loggedIn: true, viewerId: auth.viewerId || null, mode: 'already' }
 
     if (auto) {
-      const { MailTemp } = await import('./muse-mailtemp.mjs')
-      const mt = new MailTemp({ email, apiKey, mailPassword, log })
-      const ok = await this._autoLogin(p, mt, { ...opts, email, metaPassword, mailPassword, timeoutMs })
+      // An OTP_URL on generator.email picks that inbox; otherwise mailtemp.vn.
+      const mt = genmail
+        ? new (await import('./muse-genmail.mjs')).GeneratorEmail({ email, url: otpUrl, log })
+        : new (await import('./muse-mailtemp.mjs')).MailTemp({ email, apiKey, mailPassword, log })
+      let ok
+      try { ok = await this._autoLogin(p, mt, { ...opts, email, metaPassword, mailPassword, timeoutMs }) }
+      finally { await mt.close?.() }
       auth = await this.checkAuth()
       if (ok && auth.ok) return { loggedIn: true, viewerId: auth.viewerId || null, mode: 'auto' }
       if (HEADLESS) return { loggedIn: false, mode: 'auto-failed', hint: 'Auto-login did not complete (captcha / unexpected screen?). Re-run headed (unset MUSE_HEADLESS) to finish manually, or check credentials.' }

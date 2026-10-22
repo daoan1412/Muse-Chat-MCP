@@ -265,10 +265,11 @@ class NoiseTransport {
       const mailPassword = opts.mailPassword || creds.mailPassword
       const metaPassword = opts.metaPassword || creds.metaPassword
       const apiKey = opts.apiKey || creds.apiKey
-      const hasCreds = !!(metaPassword || mailPassword || apiKey)
+      const otpUrl = opts.otpUrl || creds.otpUrl
+      const hasCreds = !!(metaPassword || mailPassword || apiKey || /generator\.email/i.test(otpUrl || ''))
       if (email && hasCreds && opts.auto !== false) {
         const d = new MuseDriver(a.profileDir)
-        try { await d.login({ ...opts, email, metaPassword, mailPassword, apiKey }) }
+        try { await d.login({ ...opts, email, metaPassword, mailPassword, apiKey, otpUrl }) }
         catch (e) { log('noise: browser seed sign-in failed:', e.message) }
         await d.close().catch(() => {}) // release the profile lock before grabCookies()
       }

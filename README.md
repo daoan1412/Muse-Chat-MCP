@@ -105,6 +105,12 @@ when `mail_api_key` / `MUSE_MAILTEMP_API_KEY` is set, and otherwise uses the
 headed (default) — Meta may show a captcha or an unexpected screen that headless
 can't get past; on failure it falls back to waiting for a manual sign-in.
 
+**generator.email inboxes** have no API: set the account's `OTP_URL` to its inbox page
+(`MUSE_ACCOUNT_<ID>_OTP_URL=https://generator.email/<domain>/<user>`, no `PASSWORD`
+needed when Meta signs in with a code only) and `muse_login` reads the code from that
+page with its own small Chromium (`muse-genmail.mjs`, regular desktop UA — the site
+rate-limits a HeadlessChrome one).
+
 ---
 
 ## Use it as an MCP server
@@ -479,7 +485,7 @@ opencode, Cursor, Cline, Aider, … anything that can read files.
 | `MUSE_ACCOUNT_<ID>_PASSWORD` | – | that account's mailtemp mailbox password — also sent as the Meta password |
 | `MUSE_ACCOUNT_<ID>_META_PASSWORD` | – | optional, overrides `…_PASSWORD` for the Meta form |
 | `MUSE_ACCOUNT_<ID>_API_KEY` | – | optional per-account `x-api-key` for reading the OTP |
-| `MUSE_ACCOUNT_<ID>_OTP_URL` | – | informational: mailbox where the code arrives (shown by `muse_status`) |
+| `MUSE_ACCOUNT_<ID>_OTP_URL` | – | mailbox where the code arrives (shown by `muse_status`); a `https://generator.email/…` URL makes `muse_login` read the OTP from that page |
 | `MUSE_ACCOUNT_ID` | – | pick one `.env` account for `tools/capture-noise.mjs` |
 
 ---
