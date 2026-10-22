@@ -29,7 +29,7 @@ See `README.md` for usage.
   gone or was recycled by a non-Chrome process, so a hard-killed server does not wedge the profile.
 - `muse-mailtemp.mjs` — mailtemp.vn client for OTP-based auto-login; public API (`x-api-key`,
   `GET /api/code/{email}`) preferred, mailbox-password flow (`/api/site/unlock` → `/api/site/inbox`)
-  as fallback. Normalizes messages to `{id, code, from, subject}` and exposes `waitForCode(seen)`.
+  as fallback (a web-made box has no password: its open token goes in `MAIL_TOKEN` and unlock is skipped). Normalizes messages to `{id, code, from, subject}` and exposes `waitForCode(seen)`.
 - `muse-genmail.mjs` — generator.email reader (`GeneratorEmail extends MailTemp`): no API, so it opens the inbox
   page in its own Chromium with a desktop UA (HeadlessChrome gets rate-limited) and parses `#email-table` rows;
   the OTP is in the subject. `close()` after login.

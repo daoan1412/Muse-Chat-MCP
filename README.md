@@ -485,6 +485,7 @@ opencode, Cursor, Cline, Aider, … anything that can read files.
 | `MUSE_ACCOUNT_<ID>_PASSWORD` | – | that account's mailtemp mailbox password — also sent as the Meta password |
 | `MUSE_ACCOUNT_<ID>_META_PASSWORD` | – | optional, overrides `…_PASSWORD` for the Meta form |
 | `MUSE_ACCOUNT_<ID>_API_KEY` | – | optional per-account `x-api-key` for reading the OTP |
+| `MUSE_ACCOUNT_<ID>_MAIL_TOKEN` | – | open token of a mailtemp box made on the web (`POST /api/site/mailboxes`, no password); used instead of `…_PASSWORD` to read the OTP |
 | `MUSE_ACCOUNT_<ID>_OTP_URL` | – | mailbox where the code arrives (shown by `muse_status`); a `https://generator.email/…` URL makes `muse_login` read the OTP from that page |
 | `MUSE_ACCOUNT_ID` | – | pick one `.env` account for `tools/capture-noise.mjs` |
 

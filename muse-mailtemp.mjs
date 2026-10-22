@@ -9,6 +9,8 @@
  *   B) Mailbox-password flow (no API key; works with the temp-mail password)
  *        POST /api/site/unlock  {address,password} -> {token}
  *        GET  /api/site/inbox?address=…             (header x-mailbox-token)
+ *      A box made on the web (POST /api/site/mailboxes) has no password, only the
+ *      token it was created with — pass that as mailToken and unlock is skipped.
  *
  * Mode A is preferred when an API key is present; otherwise B is used when a
  * mailbox password is present. Both return the same normalized message shape
@@ -27,13 +29,13 @@ export function extractCode(text) {
 }
 
 export class MailTemp {
-  constructor({ email, apiKey, mailPassword, log = () => {} } = {}) {
+  constructor({ email, apiKey, mailPassword, mailToken, log = () => {} } = {}) {
     this.email = email || ''
     this.apiKey = apiKey || process.env.MUSE_MAILTEMP_API_KEY || ''
     this.mailPassword = mailPassword || process.env.MUSE_MAIL_PASSWORD || ''
     this.log = log
-    this.token = null
-    this.mode = this.apiKey ? 'api' : this.mailPassword ? 'site' : 'none'
+    this.token = mailToken || process.env.MUSE_MAIL_TOKEN || null
+    this.mode = this.apiKey ? 'api' : this.mailPassword || this.token ? 'site' : 'none'
   }
 
   // site/unlock: exchange the mailbox password for a short-lived inbox token.
@@ -75,7 +77,7 @@ export class MailTemp {
         id: m.id, code: m.code, from: m.from || '', subject: m.subject || '',
       }))
     }
-    throw new Error('mailtemp: need an API key (x-api-key) or a mailbox password')
+    throw new Error('mailtemp: need an API key (x-api-key), a mailbox password or a mailbox token')
   }
 
   // Latest OTP as plain text (mode A only); returns '' when none yet.

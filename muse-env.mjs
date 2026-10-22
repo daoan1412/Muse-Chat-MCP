@@ -79,6 +79,7 @@ export function accountCreds(id, env = process.env) {
     mailPassword,
     metaPassword: pick('META_PASSWORD') || env.MUSE_META_PASSWORD || mailPassword,
     apiKey: pick('API_KEY') || env.MUSE_MAILTEMP_API_KEY || '',
+    mailToken: pick('MAIL_TOKEN') || env.MUSE_MAIL_TOKEN || '',
     otpUrl: pick('OTP_URL') || '',
   }
 }
