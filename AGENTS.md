@@ -56,7 +56,9 @@ See `README.md` for usage.
   (`NoiseTransport._serial(a, …)`), different accounts run in parallel. Browser stays single-account.
 - Load balancing (noise): requests that do NOT name an account are spread by `MUSE_ACCOUNT_LB`
   (`round_robin` default when >1 | `least_conn` | `first`/`none`); an explicit `x-muse-account`/`account`
-  always pins its account, and a failed candidate fails over to the next (`_turnWithFailover`). Reads
+  always pins its account, and a failed candidate fails over to the next (`_turnWithFailover`). An account out of
+  quota (`_depleted`: usage meter read every `MUSE_QUOTA_CHECK_SEC` by `_checkQuotas`, on first connect, and on
+  every `usage()` call) is not an LB candidate; all out → `quotaExhausted` → shim `503 insufficient_quota`. Reads
   (`list_chats`/`usage`/…) stay pinned to the default for determinism — LB applies to `chat`/`chatStream`.
 - Streaming emits only **monotonic, stability-quieted** text; exactly one `finish_reason`.
 - Tool calling is **decision-only** (Muse must not actually execute the tool).
@@ -96,6 +98,10 @@ See `README.md` for usage.
   `NoiseTransportFrame` reassembled by `chunk_id` (max 256 chunks, `CHUNK_MAX` 65489).
 - Body-bearing requests MUST send a `content-type: application/json` header in the
   `ApplicationRequest.headers` — without it the gateway returns `415`.
+- All-or-nothing attachments: `_run` reads every ref up front (unreadable → `badInput` → 400, no failover) and
+  `_uploadAll` must upload all of them before `chat` — never send a turn with fewer images (Muse still answers 200 and
+  schema-valid about what it got). A failed upload on a live connection is retried in place and does NOT close the
+  connection (it carries the account's other turns); a dead one fails the attempt.
 - Attachments: `POST /fs/write` `{path:"workspace/user/files/<name>", data_base64,
   overwrite, create_parent}` (chunk 512 KiB, append for later parts), then reference the
   file in the message text as `![alt](sandbox://workspace/user/files/<name>)`.

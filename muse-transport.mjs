@@ -138,6 +138,17 @@ function extractMedia(events) {
   return out
 }
 
+const clientLive = (c) => !!(c && c.transport && c.ws && c.ws.readyState === 1)
+
+// Every account the LB could use is out of quota: fail the turn (the shim answers 503) instead of sending it anyway.
+function quotaExhausted(accts) {
+  const resets = accts.map((a) => a.quota?.resetsAt).filter(Boolean).sort((x, y) => x - y)
+  const next = resets.length ? `; next weekly reset ${new Date(resets[0] * 1000).toISOString()}` : ''
+  const e = new Error(`every Muse account is out of quota (weekly limit and bought tokens used up: ${accts.map((a) => a.id).join(', ')})${next}`)
+  e.quotaExhausted = true
+  return e
+}
+
 class NoiseTransport {
   constructor() {
     this.accounts = new Map() // id -> { id, profileDir, cookies, client, viewerId, connecting, q, inflight, downUntil }
@@ -150,6 +161,10 @@ class NoiseTransport {
     this.scan = entries.includes('*')
     this.scanEveryMs = Math.max(0, Number(process.env.MUSE_ACCOUNTS_RESCAN_SEC ?? 30)) * 1000
     this.scannedAt = 0
+    // Quota guard: every MUSE_QUOTA_CHECK_SEC (0 = off) read each connected account's usage meter; an account whose
+    // weekly limit AND bought tokens are used up leaves the auto pool until a later read says otherwise
+    this.quotaEveryMs = Math.max(0, Number(process.env.MUSE_QUOTA_CHECK_SEC ?? 120)) * 1000
+    if (this.quotaEveryMs) setInterval(() => { this._checkQuotas().catch(() => {}) }, this.quotaEveryMs).unref()
     entries.filter((e) => e !== '*').forEach((e, i) => {
       const eq = e.indexOf('=')
       let id, dir
@@ -164,7 +179,7 @@ class NoiseTransport {
   _add(id, profileDir) {
     if (this.accounts.has(id)) return
     // creds come from .env (MUSE_ACCOUNT_<ID>_*), never from literals in this file
-    this.accounts.set(id, { id, profileDir, creds: accountCreds(id), cookies: null, client: null, viewerId: null, connecting: null, inflight: 0, downUntil: 0, q: Promise.resolve() })
+    this.accounts.set(id, { id, profileDir, creds: accountCreds(id), cookies: null, client: null, viewerId: null, connecting: null, inflight: 0, downUntil: 0, quota: null, quotaError: null, q: Promise.resolve() })
     this.order.push(id)
   }
   // Pick up profile folders added under MUSE_ACCOUNTS_DIR since the last scan (only with `*` in MUSE_ACCOUNTS).
@@ -222,6 +237,7 @@ class NoiseTransport {
         const c = new MuseNoiseClient({ cookies: a.cookies, log })
         await c.connect()
         a.client = c
+        if (this.quotaEveryMs && !a.quota) this._checkQuota(a) // first connect: learn the quota before many turns land here
         return c
       } finally {
         a.connecting = null
@@ -245,7 +261,7 @@ class NoiseTransport {
   async launch(opts = {}) { await this._ensure(this._acct(opts.account)); return { ok: true, transport: 'noise', accounts: this.order, defaultAccount: this.defaultId } }
   async status(opts = {}) {
     const a = this._acct(opts.account)
-      const accounts = this.order.map((id) => { const x = this.accounts.get(id); return { id: x.id, email: x.creds.email || null, profileDir: x.profileDir, loggedIn: !!x.cookies, connected: !!(x.client && x.client.ws && x.client.ws.readyState === 1), inflight: x.inflight || 0, viewerId: x.viewerId } })
+      const accounts = this.order.map((id) => { const x = this.accounts.get(id); return { id: x.id, email: x.creds.email || null, profileDir: x.profileDir, loggedIn: !!x.cookies, connected: !!(x.client && x.client.ws && x.client.ws.readyState === 1), inflight: x.inflight || 0, viewerId: x.viewerId, inPool: !this._depleted(x), quota: x.quota, quotaError: x.quotaError } })
     const connected = !!(a.client && a.client.ws && a.client.ws.readyState === 1)
     return {
       browserRunning: false, url: APP_URL, transport: 'noise',
@@ -281,26 +297,55 @@ class NoiseTransport {
     return { account: a.id, loggedIn: h.status === 200, transport: 'noise', viewerId: a.viewerId }
   }
   async newChat(opts = {}) { const a = this._acct(opts.account); return { ok: true, transport: 'noise', account: a.id, note: 'over noise a new side chat is created per request via new_thread/newSession (the thread materializes on first send)' } }
+  // Upload every file of the turn or fail: a turn that went out with fewer images than asked still came back 200 and
+  // schema-valid (Muse just answers about what it got), so a lost image was invisible to the caller. A failure on a
+  // live connection (VM `fs.write 502`, 60 s timeout) is retried in place — the connection carries the account's other
+  // turns, so it is not closed for one file; a dead connection fails the attempt (fresh connection, then LB failover).
+  async _uploadAll(client, files, signal) {
+    const retries = Math.max(0, Number(process.env.MUSE_UPLOAD_RETRY ?? 2))
+    const backoff = Math.max(0, Number(process.env.MUSE_UPLOAD_BACKOFF_MS ?? 1500))
+    const out = []
+    let retried = 0
+    for (const f of files) {
+      for (let k = 0; ; k++) {
+        if (signal && signal.aborted) throw abortedError()
+        try { out.push(await client.uploadAttachment(f.bytes, f.name, f.mime)); break }
+        catch (e) {
+          if (!clientLive(client) || k >= retries) {
+            const err = new Error(`attachment ${f.n}/${files.length} upload failed: ${e.message}`)
+            err.upload = true
+            throw err
+          }
+          retried++
+          await sleep(backoff * (k + 1))
+        }
+      }
+    }
+    if (retried) log(`attachments: ${out.length}/${files.length} uploaded after ${retried} retr${retried > 1 ? 'ies' : 'y'}`)
+    return out
+  }
   async _run(a, prompt, opts = {}) {
     const t0 = Date.now()
     const onDelta = opts.onDelta
-    const refs = opts.files || []
-    const attachments = []
     const signal = opts.signal || null
+    // read every ref once, up front: an unreadable ref is the caller's input, not this account's fault
+    const files = []
+    for (const [i, ref] of (opts.files || []).entries()) {
+      try {
+        const { bytes, name, mime } = await readRef(ref, i + 1)
+        files.push({ bytes, name, mime: mime || mimeFor(name), n: i + 1 })
+      } catch (e) {
+        const where = typeof ref === 'string' ? ref : ref?.url || ref?.path || ref?.name || ''
+        const err = new Error(`attachment ${i + 1} unreadable (${String(where).slice(0, 80)}): ${e.message}`)
+        err.badInput = true
+        throw err
+      }
+    }
     for (let attempt = 0; attempt < 2; attempt++) {
       if (signal && signal.aborted) throw abortedError()
       const client = await this._ensure(a)
       try {
-        if (!attachments.length) {
-          for (const [i, ref] of refs.entries()) {
-            if (signal && signal.aborted) throw abortedError()
-            try {
-              const { bytes, name, mime } = await readRef(ref, i + 1)
-              const up = await client.uploadAttachment(bytes, name, mime || mimeFor(name))
-              attachments.push(up)
-            } catch (e) { log('attachment failed:', ref, e.message) }
-          }
-        }
+        const attachments = await this._uploadAll(client, files, signal) // fresh copies each attempt: the VM may have restarted
         let committed = ''
         const r = await client.chat(prompt, {
           timeoutMs: opts.timeoutMs || Number(process.env.MUSE_STALL_IDLE_MS || 120000), // idle gap between events (activity-based; see _chatOnce)
@@ -330,8 +375,10 @@ class NoiseTransport {
       } catch (e) {
         if (e.noRetry || e.aborted) throw e // Muse itself reported an error (or the caller left): return it as-is
         log('chat attempt', attempt, 'failed:', e.message)
-        try { a.client?.close() } catch {}
-        a.client = null // keep cookies; force a fresh connection on retry
+        if (!(e.upload && clientLive(client))) { // an upload failure on a live connection leaves it to the other turns
+          try { a.client?.close() } catch {}
+          a.client = null // keep cookies; force a fresh connection on retry
+        }
         if (attempt === 1) throw e
       }
     }
@@ -351,10 +398,61 @@ class NoiseTransport {
   _lbCandidates(opts = {}) {
     this._rescan()
     const ranked = this._lbOrder()
+    const live = ranked.filter((a) => !this._depleted(a))
+    if (!live.length) throw quotaExhausted(ranked)
     // an account that just failed (not logged in, rate-limited, mid-login) goes last until its cooldown ends,
     // so a broken profile does not cost every request a Chromium launch
     const now = Date.now()
-    return [...ranked.filter((a) => !(a.downUntil > now)), ...ranked.filter((a) => a.downUntil > now)]
+    return [...live.filter((a) => !(a.downUntil > now)), ...live.filter((a) => a.downUntil > now)]
+  }
+  // Out of quota = Muse says so (usage.quotaStatus DEPLETED) or the weekly limit is at 100% with no bought tokens left.
+  // Not read yet / read failed = usable.
+  _depleted(a) {
+    const q = a.quota
+    if (!q) return false
+    if (/DEPLETED|EXHAUSTED|EXCEEDED/i.test(q.status || '')) return true
+    return q.percentUsed >= 100 && q.topupBalance != null && q.topupBalance <= 0
+  }
+  _noteQuota(a, sub) {
+    const was = this._depleted(a)
+    const u = (sub && sub.usage) || {}
+    a.quota = {
+      status: u.quotaStatus || null, percentUsed: u.percentUsed ?? null, resetsAt: u.resetsAt ?? null,
+      topupBalance: sub?.topupBalance ?? null, topupTotal: sub?.topupTotal ?? null, checkedAt: Date.now(),
+    }
+    a.quotaError = null
+    const out = this._depleted(a)
+    if (out !== was) log(`quota: ${a.id} ${a.quota.status || '-'} (week ${a.quota.percentUsed ?? '?'}%, bought ${a.quota.topupBalance ?? '?'}) — ${out ? 'out of' : 'back in'} the auto pool`)
+  }
+  // Read one account's usage meter (plain HTTPS with its cookies, no model call); a failed read keeps the last reading.
+  _checkQuota(a) {
+    if (a.quotaChecking) return a.quotaChecking
+    a.quotaChecking = (async () => {
+      try {
+        const c = a.client || new MuseNoiseClient({ cookies: a.cookies, log })
+        const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('usage read timed out')), 30000).unref())
+        this._noteQuota(a, await Promise.race([c.usage(), timeout]))
+      } catch (e) {
+        if (a.quotaError !== e.message) log(`quota: ${a.id} read failed: ${e.message}`)
+        a.quotaError = e.message
+      } finally {
+        a.quotaChecking = null
+      }
+    })()
+    return a.quotaChecking
+  }
+  // Accounts that have not connected yet are skipped (no Chromium launch just to read a meter); _ensure checks them on connect.
+  async _checkQuotas() {
+    if (this._quotaLoop) return
+    this._quotaLoop = true
+    try {
+      for (const id of [...this.order]) {
+        const a = this.accounts.get(id)
+        if (a && (a.client || a.cookies)) await this._checkQuota(a)
+      }
+    } finally {
+      this._quotaLoop = false
+    }
   }
   _lbOrder() {
     const n = this.order.length
@@ -370,10 +468,23 @@ class NoiseTransport {
   // to the next so one dead or rate-limited account doesn't sink the request.
   async _turnWithFailover(cands, prompt, opts = {}) {
     let last
+    let tried = 0
     for (const a of cands) {
+      // meter never read (shim just started / account just joined): wait for the first read instead of piling a burst
+      // of turns on an account that may be out of quota; concurrent turns share the one read
+      if (this.quotaEveryMs && !a.quota && !a.quotaError) {
+        // hold a place while waiting, or least_conn sends every turn arriving meanwhile to this same account (a herd of
+        // ~80 turns uploading at once on one connection drops it within 2 s, then moves on to the next account)
+        a.inflight = (a.inflight || 0) + 1
+        try { await this._ensure(a); await this._checkQuota(a) } catch (e) { a.quotaError = e.message }
+        finally { a.inflight = Math.max(0, (a.inflight || 0) - 1) }
+        if (opts.signal && opts.signal.aborted) throw abortedError()
+        if (this._depleted(a)) continue
+      }
+      tried++
       try { return await this._turn(a, prompt, opts) }
       catch (e) {
-        if (e.aborted) throw e // the caller is gone: no failover, and the account did nothing wrong
+        if (e.aborted || e.badInput) throw e // the caller is gone / sent an unreadable file: no failover, the account did nothing wrong
         last = e
         log('LB failover from', a.id, ':', e && e.message)
         if (cands.length > 1) {
@@ -382,6 +493,7 @@ class NoiseTransport {
         }
       }
     }
+    if (!tried) throw quotaExhausted(cands)
     throw last
   }
   // A new-session turn gets its own thread + event feed, so concurrent ones are
@@ -462,7 +574,9 @@ class NoiseTransport {
       if (!a.cookies) a.cookies = await grabCookies(a.profileDir)
       c = new MuseNoiseClient({ cookies: a.cookies, log })
     }
-    return { ...(await c.usage()), account: a.id, transport: 'noise' }
+    const sub = await c.usage()
+    this._noteQuota(a, sub) // a caller's read (console, muse_usage) refreshes the quota guard too
+    return { ...sub, account: a.id, transport: 'noise' }
   }
   async dumpDom(max, opts = {}) { return { note: 'dump_dom is a browser-only diagnostic (noise transport has no DOM)', transport: 'noise' } }
   async close(opts = {}) { for (const a of this.accounts.values()) { try { a.client?.close() } catch {} a.client = null } }

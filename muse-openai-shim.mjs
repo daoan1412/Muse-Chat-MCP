@@ -222,14 +222,14 @@ async function runStructured(basePrompt, rfInfo, validate, opts) {
       continue
     }
     if (validate) {
-      if (validate(ex.value)) { log(`schema attempt ${attempt}: valid`); return { obj: ex.value, attempts: attempt } }
+      if (validate(ex.value)) { log(`schema attempt ${attempt}: valid${r.account ? ` (${r.account})` : ''}`); return { obj: ex.value, attempts: attempt, account: r.account } }
       const errs = (validate.errors || []).map((v) => `${v.instancePath || '/'} ${v.message}`)
       last = { obj: ex.value, errors: errs }
       prompt = basePrompt + corrective(errs, rfInfo)
       log(`schema attempt ${attempt}: invalid (${errs.length} errors)`)
       continue
     }
-    if (ex.value && typeof ex.value === 'object') return { obj: ex.value, attempts: attempt }
+    if (ex.value && typeof ex.value === 'object') return { obj: ex.value, attempts: attempt, account: r.account }
     last = { obj: ex.value, errors: ['expected a JSON object'] }
     prompt = basePrompt + corrective(last.errors, rfInfo)
   }
@@ -371,6 +371,7 @@ async function handleChat(req, res, body) {
       res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
       res.end(JSON.stringify({
         id, object: 'chat.completion', created, model,
+        ...(out.account ? { account: out.account } : {}),
         choices: [{ index: 0, message: { role: 'assistant', content: jsonStr }, finish_reason: 'stop' }],
         usage: { prompt_tokens: approxTokens(prompt), completion_tokens: approxTokens(jsonStr), total_tokens: approxTokens(prompt) + approxTokens(jsonStr) },
       }))
@@ -447,15 +448,22 @@ async function handleChat(req, res, body) {
   } catch (err) {
     if (signal.aborted) { log('client disconnected after', Math.round((Date.now() - created * 1000) / 1000), 's — turn cancelled'); return }
     log('error:', err && err.message)
-    let msg = `Muse error: ${err && err.message ? err.message : String(err)}`
+    // every account is out of quota: 503 (not 502 "Muse error", which callers treat as this turn's failure)
+    const quota = !!(err && err.quotaExhausted)
+    const bad = !!(err && err.badInput) // a file the caller sent could not be read: 400, not Muse's fault
+    let msg = quota ? `Muse quota: ${err.message}` : bad ? `Invalid attachment: ${err.message}` : `Muse error: ${err && err.message ? err.message : String(err)}`
     if (err && err.detail && Array.isArray(err.detail.errors)) msg += ` (last attempt: ${err.detail.errors.slice(0, 6).join('; ')})`
     if (streamWriter) {
       // SSE headers already sent — a JSON error body is impossible. Emit an SSE
       // `event: error` (OpenAI-style error object) then [DONE] so the client
       // terminates cleanly instead of hanging on a silently truncated stream.
-      streamWriter.write(`event: error\ndata: ${JSON.stringify({ error: { message: msg, type: 'api_error', param: null, code: null } })}\n\n`)
+      streamWriter.write(`event: error\ndata: ${JSON.stringify({ error: { message: msg, type: quota ? 'insufficient_quota' : 'api_error', param: null, code: quota ? 'muse_quota_exhausted' : null } })}\n\n`)
       streamWriter.write('data: [DONE]\n\n')
       try { res.end() } catch {}
+    } else if (quota) {
+      sendError(res, 503, msg, 'insufficient_quota', 'muse_quota_exhausted')
+    } else if (bad) {
+      sendError(res, 400, msg, 'invalid_request_error', 'attachment_unreadable', 'messages')
     } else {
       sendError(res, 502, msg, 'api_error')
     }
