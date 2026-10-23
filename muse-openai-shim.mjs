@@ -211,9 +211,11 @@ async function runStructured(basePrompt, rfInfo, validate, opts) {
   const maxAttempts = Math.max(1, (Number(process.env.MUSE_SCHEMA_RETRY) || 2) + 1)
   let prompt = basePrompt
   let last = null
+  const accounts = [] // account of each attempt (LB may route retries elsewhere), reported on failure too
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const r = await transport.chat(prompt, opts)
-    if (r.error && !r.reply) throw new Error(r.error)
+    if (r.account) accounts.push(r.account)
+    if (r.error && !r.reply) { const e = new Error(r.error); e.account = r.account; throw e }
     const ex = extractJson(r.reply || '')
     if (!ex.ok) {
       last = { raw: r.reply, errors: ['reply is not valid JSON'] }
@@ -235,6 +237,8 @@ async function runStructured(basePrompt, rfInfo, validate, opts) {
   }
   const err = new Error('Muse did not return schema-valid JSON')
   err.detail = last
+  err.account = accounts[accounts.length - 1]
+  if (new Set(accounts).size > 1) err.accounts = accounts
   throw err
 }
 
@@ -284,8 +288,8 @@ const chunk = (id, model, created, delta, finish = null) =>
     choices: [{ index: 0, delta, finish_reason: finish }],
   })}\n\n`
 
-function sendError(res, status, message, type = 'invalid_request_error', code = null, param = null) {
-  const body = JSON.stringify({ error: { message, type, param, code } })
+function sendError(res, status, message, type = 'invalid_request_error', code = null, param = null, extra = {}) {
+  const body = JSON.stringify({ ...extra, error: { message, type, param, code } })
   if (res.headersSent) { try { res.end() } catch {} return }
   res.writeHead(status, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
   res.end(body)
@@ -447,7 +451,12 @@ async function handleChat(req, res, body) {
     }))
   } catch (err) {
     if (signal.aborted) { log('client disconnected after', Math.round((Date.now() - created * 1000) / 1000), 's — turn cancelled'); return }
-    log('error:', err && err.message)
+    // account that ran the failed turn (top-level `account`, as on a success); `accounts` when schema retries moved around
+    const who = {
+      ...(err && err.account ? { account: err.account } : {}),
+      ...(err && err.accounts ? { accounts: err.accounts } : {}),
+    }
+    log('error:', err && err.message, who.account ? `(${(who.accounts || [who.account]).join(' → ')})` : '')
     // every account is out of quota: 503 (not 502 "Muse error", which callers treat as this turn's failure)
     const quota = !!(err && err.quotaExhausted)
     const bad = !!(err && err.badInput) // a file the caller sent could not be read: 400, not Muse's fault
@@ -457,15 +466,15 @@ async function handleChat(req, res, body) {
       // SSE headers already sent — a JSON error body is impossible. Emit an SSE
       // `event: error` (OpenAI-style error object) then [DONE] so the client
       // terminates cleanly instead of hanging on a silently truncated stream.
-      streamWriter.write(`event: error\ndata: ${JSON.stringify({ error: { message: msg, type: quota ? 'insufficient_quota' : 'api_error', param: null, code: quota ? 'muse_quota_exhausted' : null } })}\n\n`)
+      streamWriter.write(`event: error\ndata: ${JSON.stringify({ ...who, error: { message: msg, type: quota ? 'insufficient_quota' : 'api_error', param: null, code: quota ? 'muse_quota_exhausted' : null } })}\n\n`)
       streamWriter.write('data: [DONE]\n\n')
       try { res.end() } catch {}
     } else if (quota) {
-      sendError(res, 503, msg, 'insufficient_quota', 'muse_quota_exhausted')
+      sendError(res, 503, msg, 'insufficient_quota', 'muse_quota_exhausted', null, who)
     } else if (bad) {
-      sendError(res, 400, msg, 'invalid_request_error', 'attachment_unreadable', 'messages')
+      sendError(res, 400, msg, 'invalid_request_error', 'attachment_unreadable', 'messages', who)
     } else {
-      sendError(res, 502, msg, 'api_error')
+      sendError(res, 502, msg, 'api_error', null, null, who)
     }
   }
 }
@@ -547,6 +556,18 @@ export function startShim({ port = PORT, host = HOST, exitOnError = false } = {}
       if (req.method === 'GET' && url === '/v1/muse/usage') {
         const params = new URL(req.url, 'http://localhost').searchParams
         const data = await transport.usage({ account: params.get('account') || undefined })
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+        return res.end(JSON.stringify(data))
+      }
+
+      // Pause / resume an account: no new auto-routed turns while paused; running turns finish. Body {account, paused}.
+      if (req.method === 'POST' && url === '/v1/muse/pause') {
+        if (typeof transport.setPaused !== 'function') return sendError(res, 400, 'pausing accounts needs the noise transport')
+        let body
+        try { body = JSON.parse((await readBody(req)) || '{}') } catch { return sendError(res, 400, 'Invalid JSON body') }
+        if (!body.account) return sendError(res, 400, 'account is required', 'invalid_request_error', null, 'account')
+        let data
+        try { data = transport.setPaused(String(body.account), body.paused !== false) } catch (e) { return sendError(res, 404, e.message, 'invalid_request_error', null, 'account') }
         res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
         return res.end(JSON.stringify(data))
       }

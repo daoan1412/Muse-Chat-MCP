@@ -111,6 +111,22 @@ needed when Meta signs in with a code only) and `muse_login` reads the code from
 page with its own small Chromium (`muse-genmail.mjs`, regular desktop UA — the site
 rate-limits a HeadlessChrome one).
 
+**luuvan.site inboxes** (reseller catch-alls such as `*.animee.tokyo`, whose MX is
+Cloudflare — generator.email never gets that mail) have a public JSON API:
+`MUSE_ACCOUNT_<ID>_OTP_URL=https://luuvan.site/?inbox=<email>` makes `muse_login`
+read the code with `muse-luuvan.mjs`. A code-only account whose Meta login shows a
+password screen is moved on with "Try another way"; a code that went out before the
+inbox was first read is resent once.
+
+**New accounts while the shim runs:** add `EMAIL` + `OTP_URL` to `.env`, then
+`node muse-seed.mjs <id> [...]` signs each one in to `accounts/.<id>` (hidden from the
+`*` scan), and when the address is not a mailtemp box, adds one as a second Meta
+contact email through Accounts Center and switches `.env` to it (`muse-addmail.mjs`;
+`MUSE_ADD_MAILTEMP=0` skips), so later sign-ins still get their code after the
+reseller's inbox is gone. It then renames the folder to `accounts/<id>` and the shim
+picks it up. `node muse-addmail.mjs <id> [...]` does the mailtemp step alone for an
+account already in the pool (on a copy of its profile).
+
 ---
 
 ## Use it as an MCP server

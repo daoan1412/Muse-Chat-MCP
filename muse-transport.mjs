@@ -163,6 +163,13 @@ class NoiseTransport {
     this.scannedAt = 0
     // Quota guard: every MUSE_QUOTA_CHECK_SEC (0 = off) read each connected account's usage meter; an account whose
     // weekly limit AND bought tokens are used up leaves the auto pool until a later read says otherwise
+    // Paused accounts (an operator's call, e.g. keep fresh accounts' bought tokens in reserve): no new auto-routed
+    // turns, turns already running finish. Kept in <accounts>/.paused.json (hidden: the `*` scan skips it) so a
+    // restart keeps them; re-read whenever the file changes, so editing it by hand works too.
+    this.pausedFile = process.env.MUSE_PAUSED_FILE || path.join(this.base, '.paused.json')
+    this.paused = new Set()
+    this.pausedMtime = -1
+    this._loadPaused()
     this.quotaEveryMs = Math.max(0, Number(process.env.MUSE_QUOTA_CHECK_SEC ?? 120)) * 1000
     if (this.quotaEveryMs) setInterval(() => { this._checkQuotas().catch(() => {}) }, this.quotaEveryMs).unref()
     entries.filter((e) => e !== '*').forEach((e, i) => {
@@ -220,6 +227,27 @@ class NoiseTransport {
     if (gone.length) this.order = this.order.filter((id) => this.accounts.has(id))
     if (this.defaultId && (added.length || gone.length)) log('accounts rescan: +', added.join(',') || '-', ' -', gone.join(',') || '-', '→', this.order.length)
   }
+  _loadPaused() {
+    let mtime
+    try { mtime = fs.statSync(this.pausedFile).mtimeMs } catch { mtime = 0 }
+    if (mtime === this.pausedMtime) return
+    this.pausedMtime = mtime
+    let ids = []
+    try { const j = JSON.parse(fs.readFileSync(this.pausedFile, 'utf8')); ids = Array.isArray(j) ? j : Object.keys(j || {}) } catch {}
+    this.paused = new Set(ids.map(String))
+  }
+  setPaused(id, on = true) {
+    const a = this._acct(id)
+    this._loadPaused()
+    if (on) this.paused.add(a.id)
+    else this.paused.delete(a.id)
+    const tmp = `${this.pausedFile}.tmp-${process.pid}`
+    fs.writeFileSync(tmp, JSON.stringify([...this.paused].sort(), null, 1) + '\n')
+    fs.renameSync(tmp, this.pausedFile)
+    this.pausedMtime = fs.statSync(this.pausedFile).mtimeMs
+    log(`pause: ${a.id} ${on ? 'paused — no new turns' : 'resumed'} (paused: ${[...this.paused].join(', ') || '-'})`)
+    return { account: a.id, paused: on, inflight: a.inflight || 0 }
+  }
   _acct(id) {
     id = id || this.defaultId
     if (!this.accounts.has(id)) this._rescan(true) // a just-added profile named explicitly
@@ -261,7 +289,8 @@ class NoiseTransport {
   async launch(opts = {}) { await this._ensure(this._acct(opts.account)); return { ok: true, transport: 'noise', accounts: this.order, defaultAccount: this.defaultId } }
   async status(opts = {}) {
     const a = this._acct(opts.account)
-      const accounts = this.order.map((id) => { const x = this.accounts.get(id); return { id: x.id, email: x.creds.email || null, profileDir: x.profileDir, loggedIn: !!x.cookies, connected: !!(x.client && x.client.ws && x.client.ws.readyState === 1), inflight: x.inflight || 0, viewerId: x.viewerId, inPool: !this._depleted(x), quota: x.quota, quotaError: x.quotaError } })
+    this._loadPaused()
+      const accounts = this.order.map((id) => { const x = this.accounts.get(id); return { id: x.id, email: x.creds.email || null, profileDir: x.profileDir, loggedIn: !!x.cookies, connected: !!(x.client && x.client.ws && x.client.ws.readyState === 1), inflight: x.inflight || 0, viewerId: x.viewerId, inPool: !this._depleted(x) && !this.paused.has(x.id), paused: this.paused.has(x.id), quota: x.quota, quotaError: x.quotaError } })
     const connected = !!(a.client && a.client.ws && a.client.ws.readyState === 1)
     return {
       browserRunning: false, url: APP_URL, transport: 'noise',
@@ -283,11 +312,23 @@ class NoiseTransport {
       const apiKey = opts.apiKey || creds.apiKey
       const mailToken = opts.mailToken || creds.mailToken
       const otpUrl = opts.otpUrl || creds.otpUrl
-      const hasCreds = !!(metaPassword || mailPassword || apiKey || mailToken || /generator\.email/i.test(otpUrl || ''))
+      const hasCreds = !!(metaPassword || mailPassword || apiKey || mailToken || /generator\.email|luuvan\.site/i.test(otpUrl || ''))
       if (email && hasCreds && opts.auto !== false) {
         const d = new MuseDriver(a.profileDir)
-        try { await d.login({ ...opts, email, metaPassword, mailPassword, apiKey, mailToken, otpUrl }) }
-        catch (e) { log('noise: browser seed sign-in failed:', e.message) }
+        try {
+          const r = await d.login({ ...opts, email, metaPassword, mailPassword, apiKey, mailToken, otpUrl })
+          // an address that is not ours (reseller catch-all…) gets a mailtemp box as a second contact email, so later
+          // sign-ins still get their code; MUSE_ADD_MAILTEMP=0 turns this off
+          if (r && r.loggedIn && process.env.MUSE_ADD_MAILTEMP !== '0') {
+            const { ensureMailtempContact } = await import('./muse-addmail.mjs')
+            try {
+              if (await ensureMailtempContact(await d.requirePage(), { id: a.id, email, log })) {
+                loadDotEnv(undefined, { refresh: true })
+                a.creds = accountCreds(a.id)
+              }
+            } catch (e) { log('noise: adding a mailtemp email failed:', e.message) }
+          }
+        } catch (e) { log('noise: browser seed sign-in failed:', e.message) }
         await d.close().catch(() => {}) // release the profile lock before grabCookies()
       }
     }
@@ -389,7 +430,8 @@ class NoiseTransport {
   _turn(a, prompt, opts = {}) {
     a.inflight = (a.inflight || 0) + 1
     const settle = (r) => { a.inflight = Math.max(0, (a.inflight || 0) - 1); return r }
-    const fail = (e) => { a.inflight = Math.max(0, (a.inflight || 0) - 1); throw e }
+    // tag the error with the account that ran the turn, so the shim can report it like it does for a success
+    const fail = (e) => { a.inflight = Math.max(0, (a.inflight || 0) - 1); if (e && typeof e === 'object' && !e.account) e.account = a.id; throw e }
     const p = (opts.newSession || opts.newThread) ? this._run(a, prompt, opts) : this._serial(a, () => this._run(a, prompt, opts))
     return p.then(settle, fail)
   }
@@ -398,8 +440,15 @@ class NoiseTransport {
   _lbCandidates(opts = {}) {
     this._rescan()
     const ranked = this._lbOrder()
-    const live = ranked.filter((a) => !this._depleted(a))
-    if (!live.length) throw quotaExhausted(ranked)
+    this._loadPaused()
+    const live = ranked.filter((a) => !this._depleted(a) && !this.paused.has(a.id))
+    if (!live.length) {
+      const unpaused = ranked.filter((a) => !this.paused.has(a.id))
+      if (unpaused.length) throw quotaExhausted(unpaused)
+      const e = new Error(`every Muse account is paused (${ranked.map((a) => a.id).join(', ')})`)
+      e.quotaExhausted = true // same 503 as out of quota: callers move the work elsewhere
+      throw e
+    }
     // an account that just failed (not logged in, rate-limited, mid-login) goes last until its cooldown ends,
     // so a broken profile does not cost every request a Chromium launch
     const now = Date.now()

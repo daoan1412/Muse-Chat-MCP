@@ -340,6 +340,7 @@ export class MuseDriver {
       if (auth.ok) { log('auto-login ok at step', step); return true }
       const screen = await this._detectScreen(p)
       log(`auto-login step ${step}: screen=${screen}`)
+      if (screen === 'other') log('  page:', (await p.evaluate(() => document.body.innerText).catch(() => '')).replace(/\s+/g, ' ').slice(0, 300))
       if (screen === 'email') {
         const el = await this._findInput(p, 'email')
         if (el) {
@@ -351,9 +352,13 @@ export class MuseDriver {
           await sleep(3500); continue
         }
       }
+      if (screen === 'password' && !metaPass) {
+        // code-only account (bought accounts come with the mailbox, not the Meta password): ask for a code instead
+        if (await this._clickButton(p, /try another way|log in with (a )?code|send (me )?(a )?code|get (a )?code|use (a )?code|thử cách khác/i)) { await sleep(3000); continue }
+      }
       if (screen === 'password') {
         const el = await this._findInput(p, 'password')
-        if (el) {
+        if (el && metaPass) {
           await el.fill(metaPass); await sleep(300)
           if (!(await this._clickButton(p, /continue|next|log in|sign in|submit|tiếp tục|đăng nhập/i))) await el.press('Enter')
           await sleep(3000); continue
@@ -362,7 +367,9 @@ export class MuseDriver {
       if (screen === 'code') {
         const el = await this._findInput(p, 'code')
         if (el) {
-          const c = await mt.waitForCode(seen, { timeoutMs: Math.max(15000, Math.min(90000, opts.timeoutMs || 90000)) })
+          let c = await mt.waitForCode(seen, { timeoutMs: 45000 })
+          // the code may have gone out before the inbox was first read (an earlier attempt left the page here): resend once
+          if (!c && await this._clickButton(p, /resend code|gửi lại mã/i)) { log('no fresh OTP, resent the code'); c = await mt.waitForCode(seen, { timeoutMs: 75000 }) }
           if (!c) { log('no fresh OTP arrived'); break }
           log('filling OTP', c.code, '(', c.subject || c.from, ')')
           await el.fill(c.code); seen.add(c.id)
@@ -396,22 +403,28 @@ export class MuseDriver {
     const mailToken = opts.mailToken || process.env.MUSE_MAIL_TOKEN || ''
     const otpUrl = opts.otpUrl || process.env.MUSE_META_OTP_URL || ''
     const { isGeneratorEmailUrl } = await import('./muse-genmail.mjs')
+    const { isLuuVanUrl } = await import('./muse-luuvan.mjs')
     const genmail = isGeneratorEmailUrl(otpUrl)
-    const auto = opts.auto !== false && !!email && !!(metaPassword || mailPassword || apiKey || mailToken || genmail)
+    const luuvan = isLuuVanUrl(otpUrl)
+    const auto = opts.auto !== false && !!email && !!(metaPassword || mailPassword || apiKey || mailToken || genmail || luuvan)
 
     const p = await this.gotoApp()
     let auth = await this.checkAuth()
     if (auth.ok) return { loggedIn: true, viewerId: auth.viewerId || null, mode: 'already' }
 
     if (auto) {
-      // An OTP_URL on generator.email picks that inbox; otherwise mailtemp.vn.
+      // An OTP_URL on generator.email / luuvan.site picks that inbox; otherwise mailtemp.vn.
       const mt = genmail
         ? new (await import('./muse-genmail.mjs')).GeneratorEmail({ email, url: otpUrl, log })
-        : new (await import('./muse-mailtemp.mjs')).MailTemp({ email, apiKey, mailPassword, mailToken, log })
+        : luuvan
+          ? new (await import('./muse-luuvan.mjs')).LuuVan({ email, log })
+          : new (await import('./muse-mailtemp.mjs')).MailTemp({ email, apiKey, mailPassword, mailToken, log })
       let ok
       try { ok = await this._autoLogin(p, mt, { ...opts, email, metaPassword, mailPassword, timeoutMs }) }
       finally { await mt.close?.() }
       auth = await this.checkAuth()
+      // the page may still be navigating right after the last screen (23/10/2026: "ok at step 2" then a failed check)
+      for (let i = 0; ok && !auth.ok && i < 3; i++) { await sleep(3000); auth = await this.checkAuth() }
       if (ok && auth.ok) return { loggedIn: true, viewerId: auth.viewerId || null, mode: 'auto' }
       if (HEADLESS) return { loggedIn: false, mode: 'auto-failed', hint: 'Auto-login did not complete (captcha / unexpected screen?). Re-run headed (unset MUSE_HEADLESS) to finish manually, or check credentials.' }
       log('auto-login incomplete, falling back to manual sign-in')
