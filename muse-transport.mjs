@@ -288,6 +288,7 @@ class NoiseTransport {
   }
   async launch(opts = {}) { await this._ensure(this._acct(opts.account)); return { ok: true, transport: 'noise', accounts: this.order, defaultAccount: this.defaultId } }
   async status(opts = {}) {
+    this._rescan() // /health lists a just-seeded profile even while no turn is being routed
     const a = this._acct(opts.account)
     this._loadPaused()
       const accounts = this.order.map((id) => { const x = this.accounts.get(id); return { id: x.id, email: x.creds.email || null, profileDir: x.profileDir, loggedIn: !!x.cookies, connected: !!(x.client && x.client.ws && x.client.ws.readyState === 1), inflight: x.inflight || 0, viewerId: x.viewerId, inPool: !this._depleted(x) && !this.paused.has(x.id), paused: this.paused.has(x.id), quota: x.quota, quotaError: x.quotaError } })
