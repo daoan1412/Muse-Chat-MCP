@@ -26,6 +26,8 @@ const BASE = (process.env.MUSE_MAILTEMP_URL || 'https://mailtemp.vn').replace(/\
 const ENV_FILE = process.env.MUSE_ENV_FILE || path.join(__dirname, '.env')
 const CONTACTS = 'https://accountscenter.meta.com/youraccount/contact_points/'
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+// roots Meta's mail never reaches (23/10/2026: no code ever reached a box on entu.io.vn; the other roots got theirs)
+const SKIP_ROOTS = (process.env.MUSE_MAILTEMP_SKIP_ROOTS ?? 'entu.io.vn').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean)
 
 let rootsCache = null
 export async function mailtempRoots() {
@@ -46,7 +48,7 @@ export async function isMailtempAddress(email) {
 
 export async function createBox(localPart, exclude = []) {
   const all = await mailtempRoots()
-  const roots = all.filter((r) => !exclude.includes(r))
+  const roots = all.filter((r) => !exclude.includes(r) && !SKIP_ROOTS.includes(r.toLowerCase()))
   const root = (roots.length ? roots : all)[Math.floor(Math.random() * (roots.length || all.length))]
   const base = String(localPart || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 16)
   for (let i = 0; ; i++) {
@@ -119,7 +121,7 @@ export function saveEnv(id, box, file = ENV_FILE) {
 /** Create a box, add it on the signed-in page `p`, save it to .env. → the box, or null when Meta did not take it. */
 export async function ensureMailtempContact(p, { id, email, log = () => {} }) {
   if (await isMailtempAddress(email)) return null
-  // 23/10/2026: Meta's code never reached a box on entu.io.vn (the others got theirs) → one more try on another root
+  // a root can stop receiving Meta's mail (see SKIP_ROOTS) → one more try on another root
   const tried = []
   for (let attempt = 1; ; attempt++) {
     const box = await createBox(id, tried)

@@ -498,6 +498,7 @@ opencode, Cursor, Cline, Aider, … anything that can read files.
 | `MUSE_MAIL_PASSWORD` | – | mailtemp.vn mailbox password (site/unlock OTP flow) |
 | `MUSE_MAILTEMP_API_KEY` | – | mailtemp.vn public API key (`x-api-key`), preferred for reading OTP |
 | `MUSE_MAILTEMP_URL` | `https://mailtemp.vn` | mailtemp base URL |
+| `MUSE_MAILTEMP_SKIP_ROOTS` | `entu.io.vn` | mailtemp roots never used for the box `muse-addmail` adds (Meta's code does not reach them); comma-separated, empty = use all |
 | `MUSE_ENV_FILE` | `./.env` | dotenv file loaded at startup by `muse-env.mjs` (a real env var always beats the file) |
 | `MUSE_ACCOUNT_<ID>_EMAIL` | – | per-account sign-in address, `<ID>` = an id from `MUSE_ACCOUNTS` (either case) |
 | `MUSE_ACCOUNT_<ID>_PASSWORD` | – | that account's mailtemp mailbox password — also sent as the Meta password |
