@@ -274,8 +274,8 @@ node muse-cli.mjs --usage
 ```
 
 It reads the `fetchSubscriptionAction` RSC action (works on both transports). The action id is
-build-specific; after a Muse redeploy refresh it with `node tools/capture-subaction.mjs` or set
-`MUSE_SUBSCRIPTION_ACTION_ID`.
+build-specific; after a Muse redeploy the noise client finds the new one in the app's JS by itself
+(browser transport: refresh it with `node tools/capture-subaction.mjs` or set `MUSE_SUBSCRIPTION_ACTION_ID`).
 
 ---
 

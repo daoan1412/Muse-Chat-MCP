@@ -26,7 +26,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { SUBSCRIPTION_ACTION_ID, parseFlightResult, isMuseSorry, museSorryError } from './muse-noise.mjs'
+import { subscriptionAction, parseFlightResult, isMuseSorry, museSorryError } from './muse-noise.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -247,7 +247,7 @@ export class MuseDriver {
         const t = await res.text()
         return { status: res.status, text: t }
       } catch (e) { return { status: 0, text: String(e) } }
-    }, { id: SUBSCRIPTION_ACTION_ID, includeAgreement })
+    }, { id: subscriptionAction(), includeAgreement })
     if (!txt || txt.status !== 200) throw new Error(`usage action -> ${txt && txt.status}: ${String(txt && txt.text).slice(0, 200)}`)
     const r = parseFlightResult(txt.text)
     if (!r || !r.success) throw new Error('usage action failed: ' + JSON.stringify((r && r.error) || r).slice(0, 200))

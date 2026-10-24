@@ -25,9 +25,12 @@ const C = globalThis.crypto || globalThis.webcrypto
 const LB_HOST = process.env.MUSE_NOISE_HOST || 'hatch.metaaivm.com'
 const NOISE_PATH = '/v1/noise'
 const APP_ID = 'hatch-web'
-// Next.js RSC server-action id for fetchSubscriptionAction (the Usage/credits
-// meter). Build-specific hash — override with MUSE_SUBSCRIPTION_ACTION_ID after a redeploy.
-export const SUBSCRIPTION_ACTION_ID = process.env.MUSE_SUBSCRIPTION_ACTION_ID || '4029ac5c4bd03136487d91ebde5de39c64b35229b4'
+// Next.js RSC server-action id for fetchSubscriptionAction (the Usage/credits meter). Build-specific hash: a Muse
+// redeploy changes it (24/10/2026 01:07 UTC 4029ac5c… → 40034617…, every meter read then got 404 "Server action not
+// found" and the pool kept stale quotas) → usage() finds the new id in the app's JS (refreshSubscriptionAction).
+// MUSE_SUBSCRIPTION_ACTION_ID sets the id to start from.
+let subscriptionActionId = process.env.MUSE_SUBSCRIPTION_ACTION_ID || '40034617c46db812e70eec8e362677944a0a532adf'
+export const subscriptionAction = () => subscriptionActionId
 const PROTONAME = 'Noise_XX_25519_AESGCM_SHA256'
 const CHUNK_MAX = 65489
 // Capabilities the real client sends in chat.subscribe (buildHatchChatCapabilities).
@@ -334,6 +337,60 @@ export function parseFlightResult(txt) {
   return JSON.parse(line.slice(ref.length + 1))
 }
 
+// Headers of the real Chrome the app origin expects: without the client hints Cloudflare answers 403.
+const APP_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'
+const CLIENT_HINTS = {
+  'accept-encoding': 'gzip, deflate, br',
+  'accept-language': 'en-US,en;q=0.9',
+  'sec-ch-prefers-color-scheme': 'light',
+  'sec-ch-ua': '"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Linux"',
+  'user-agent': APP_UA,
+}
+// The client bundle declares each action as createServerReference("<id>", x.callServer, void 0, x.findSourceMapURL, "<name>").
+const ACTION_RE = /"([0-9a-f]{40,})"\s*,[^"]{0,160}?"fetchSubscriptionAction"/
+const CHUNK_RE = /static\/chunks\/[\w.\-/]+?\.js/g
+const ACTION_REFRESH_MS = 10 * 60e3
+let actionRefresh = null
+let actionRefreshAt = 0
+// Find fetchSubscriptionAction's current id in the app's JS. Its chunk loads lazily (the Settings dialog), so walk the
+// chunk references out from the signed-in page (24/10: found after 314 public chunks, 27 MB, 7 s, no browser). One walk
+// for every account at a time, at most one per ACTION_REFRESH_MS. → true when the id changed.
+function refreshSubscriptionAction(client) {
+  if (actionRefresh) return actionRefresh
+  if (Date.now() - actionRefreshAt < ACTION_REFRESH_MS) return Promise.resolve(false)
+  actionRefresh = (async () => {
+    const t0 = Date.now()
+    const page = await fetch(client.origin + '/', {
+      headers: { ...CLIENT_HINTS, accept: 'text/html', 'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate', 'sec-fetch-site': 'none', cookie: client.cookieHeader },
+      redirect: 'manual',
+    })
+    if (page.status !== 200) throw new Error(`app page -> ${page.status} (signed out?)`)
+    const seen = new Set()
+    const queue = []
+    const add = (s) => { const u = client.origin + '/_next/' + s; if (!seen.has(u)) { seen.add(u); queue.push(u) } }
+    for (const m of (await page.text()).matchAll(CHUNK_RE)) add(m[0])
+    while (queue.length && seen.size <= 1500) {
+      const batch = queue.splice(0, 16)
+      const texts = await Promise.all(batch.map((u) => fetch(u, { headers: { 'user-agent': APP_UA } }).then((r) => (r.ok ? r.text() : '')).catch(() => '')))
+      for (const t of texts) {
+        const m = t.match(ACTION_RE)
+        if (m) {
+          const changed = m[1] !== subscriptionActionId
+          client.log(`[muse-noise] fetchSubscriptionAction id ${changed ? `${subscriptionActionId} -> ${m[1]}` : 'unchanged'} (${seen.size} chunks, ${Date.now() - t0} ms)`)
+          subscriptionActionId = m[1]
+          return changed
+        }
+        for (const r of t.matchAll(CHUNK_RE)) add(r[0])
+      }
+    }
+    throw new Error(`fetchSubscriptionAction not found in ${seen.size} chunks`)
+  })().catch((e) => { client.log(`[muse-noise] usage action id refresh failed: ${e.message}`); return false })
+    .finally(() => { actionRefresh = null; actionRefreshAt = Date.now() })
+  return actionRefresh
+}
+
 // Follows one turn on its feed. A turn may post a commentary message first ("I'll open the attached image…",
 // metadata.message_kind "commentary") and its answer in a second message: delta.message_done closes each MESSAGE,
 // task.status (root agent) closes the TURN. Stopping at the first message_done took the commentary for the reply —
@@ -424,30 +481,29 @@ export class MuseNoiseClient {
   // Usage/credits meter via the Next.js RSC server action fetchSubscriptionAction.
   // Plain HTTPS POST to the app origin (no noise WS needed) — only the login cookies.
   // Cloudflare bot-checks the request, so send full browser client-hint headers.
-  async usage({ includeAgreement = true } = {}) {
+  // 404 "Server action not found" = Muse redeployed: look up the new action id once, then read again.
+  async usage({ includeAgreement = true } = {}, retried = false) {
+    const id = subscriptionActionId
     const res = await fetch(this.origin + '/', {
       method: 'POST',
       headers: {
+        ...CLIENT_HINTS,
         accept: 'text/x-component',
-        'accept-encoding': 'gzip, deflate, br',
-        'accept-language': 'en-US,en;q=0.9',
         'content-type': 'text/plain;charset=UTF-8',
-        'next-action': SUBSCRIPTION_ACTION_ID,
+        'next-action': id,
         origin: this.origin,
         referer: this.origin + '/',
-        'sec-ch-prefers-color-scheme': 'light',
-        'sec-ch-ua': '"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Linux"',
         'sec-fetch-dest': 'empty',
         'sec-fetch-mode': 'cors',
         'sec-fetch-site': 'same-origin',
-        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
         cookie: this.cookieHeader,
       },
       body: JSON.stringify([{ includeAgreement }]),
     })
     const txt = await res.text()
+    // another account's read may have found the new id while this one was on the wire
+    if (res.status === 404 && /server action not found/i.test(txt) && !retried
+      && (id !== subscriptionActionId || await refreshSubscriptionAction(this))) return this.usage({ includeAgreement }, true)
     if (!res.ok) throw new Error(`usage action -> ${res.status}: ${txt.slice(0, 200)}`)
     const r = parseFlightResult(txt)
     if (!r || !r.success) throw new Error('usage action failed: ' + JSON.stringify((r && r.error) || r).slice(0, 200))

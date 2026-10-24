@@ -77,8 +77,10 @@ See `README.md` for usage.
   action id to the app origin with `accept: text/x-component` + `content-type: text/plain` +
   `next-action` and full browser client-hint headers (`sec-ch-ua*`, `accept-encoding`, `accept-language`)
   or Cloudflare returns `403 Forbidden`; parse the flight result from the `1:` line. The action id is a
-  build-specific hash — refresh it with `tools/capture-subaction.mjs` (or set `MUSE_SUBSCRIPTION_ACTION_ID`)
-  after a Muse redeploy.
+  build-specific hash: on `404 Server action not found` (a Muse redeploy) `usage()` walks the app's public JS
+  chunks for `createServerReference("<id>", …, "fetchSubscriptionAction")` (one walk for all accounts, ≤1 per
+  10 min) and reads again; `MUSE_SUBSCRIPTION_ACTION_ID` sets the starting id, `tools/capture-subaction.mjs` is the
+  manual fallback.
 - Attachments go on the hidden composer `input[type="file"]` via `setInputFiles`.
 - **Never** commit secrets: no `accounts/` (Chrome/Muse profiles), no `*.har`, no tokens.
 - Credentials **never** live in code — `.env` (git-ignored) or the real environment is the
