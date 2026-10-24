@@ -271,17 +271,27 @@ function chunkMessage(bytes) {
 }
 
 class NoiseTransport {
-  constructor(c1, c2) { this.c1 = c1; this.c2 = c2; this.nextStream = 1n; this.pending = new Map() }
+  constructor(c1, c2) { this.c1 = c1; this.c2 = c2; this.nextStream = 1n; this.pending = new Map(); this._sendQ = Promise.resolve() }
   allocStream() { return this.nextStream++ }
+  // Encrypt + send one message's chunks, one message at a time. The cipher takes its nonce when encrypt() is called but
+  // WebCrypto finishes out of order (a 512 KB fs.write chunk after a small frame queued behind it), so concurrent turns
+  // put frames on the wire out of nonce order; the gateway fails to decrypt and drops the connection (1006) with every
+  // turn on it. 5 parallel 300 KB uploads were enough to kill a connection, ~36 turns lost per drop.
+  _sendChunks(h) {
+    const run = this._sendQ.then(async () => {
+      for (const c of chunkMessage(h)) {
+        const ct = await this.c1.encrypt(new Uint8Array(0), c)
+        this.ws.send(ct)
+      }
+    })
+    this._sendQ = run.catch(() => {}) // keep the queue alive after a failed send
+    return run
+  }
   async sendRequest(streamId, service, appReq) {
     // Set the oneof member directly (encodeMessage has no oneof awareness):
     // ServiceFrame{stream_id, request=ApplicationRequest}.
     const frame = encodeMessage({ stream_id: streamId, request: appReq }, S_FRAME)
-    const h = encodeMessage({ service, payload: frame }, S_SREQ)
-    for (const c of chunkMessage(h)) {
-      const ct = await this.c1.encrypt(new Uint8Array(0), c)
-      this.ws.send(ct)
-    }
+    await this._sendChunks(encodeMessage({ service, payload: frame }, S_SREQ))
     return streamId
   }
   // Client-side stream reset (like HTTP/2 RST_STREAM): the gateway caps a connection at ~256 open streams and
@@ -289,11 +299,7 @@ class NoiseTransport {
   // gateway answers `reset code=3 too many concurrent streams` and drops the whole connection. Code 8 = cancel.
   async resetStream(streamId, code = 8) {
     const frame = encodeMessage({ stream_id: streamId, reset: { code, reason: new Uint8Array(0) } }, S_FRAME)
-    const h = encodeMessage({ service: 0, payload: frame }, S_SREQ)
-    for (const c of chunkMessage(h)) {
-      const ct = await this.c1.encrypt(new Uint8Array(0), c)
-      this.ws.send(ct)
-    }
+    await this._sendChunks(encodeMessage({ service: 0, payload: frame }, S_SREQ))
   }
   // decrypt one wire frame -> NoiseTransportFrame, reassemble by chunk_id.
   async feedFrame(bytes) {
@@ -328,6 +334,57 @@ export function parseFlightResult(txt) {
   return JSON.parse(line.slice(ref.length + 1))
 }
 
+// Follows one turn on its feed. A turn may post a commentary message first ("I'll open the attached image…",
+// metadata.message_kind "commentary") and its answer in a second message: delta.message_done closes each MESSAGE,
+// task.status (root agent) closes the TURN. Stopping at the first message_done took the commentary for the reply —
+// 12 of 15 schema parse-fails on 23/10, while Muse went on to write (and bill) the real answer nobody read.
+// A feed that never showed task.status (joined mid-turn): after a message_done, quiet this long → confirm with the history.
+// A feed that did show it waits for the terminal task.status: a commentary can be followed by 45 s of silent image reading.
+const DONE_GRACE_MS = Number(process.env.MUSE_DONE_GRACE_MS ?? 15000)
+const DEBUG_TURN = process.env.MUSE_DEBUG_TURN === '1' // log every non-delta event of a turn (diagnostics)
+const TASK_END = new Set(['completed', 'failed', 'errored', 'cancelled', 'canceled', 'interrupted'])
+// An event about THIS session. A feed also carries broadcasts (sessions.updated / tasks.updated of other sessions and
+// background jobs) that kept the idle timer alive while the session's own events had stopped: turns sat up to the 30-min
+// backstop on sessions Muse had completed 12 minutes earlier (23/10).
+function ownEvent(ev, sid) {
+  if (!sid) return true
+  const pl = ev.payload || {}
+  if (pl.session_id) return pl.session_id === sid // a task.status / message of ANOTHER session must not end this turn
+  const n = ev.event || ev.event_name || ''
+  return n.startsWith('delta.') || n === 'task.status' || n === 'agent.status' // (Muse stamps these with session_id anyway)
+}
+function turnTracker() {
+  let streamed = '', final = null
+  return {
+    messageDone: false, // at least one message closed (its text is the reply unless another message follows)
+    taskEnded: null, // task.status of the root agent once the turn is over
+    sawTask: false, // this feed reports task.status: wait for its end instead of guessing from silence
+    messageId: null,
+    get reply() { return final !== null ? final : streamed },
+    set final(v) { final = v; this.messageDone = true },
+    // → 'message' (a message closed), 'end' (the turn is over) or null
+    feed(ev) {
+      const name = ev.event || ev.event_name, pl = ev.payload || {}
+      if (name === 'delta.message_start') { streamed = ''; return null }
+      if (name === 'delta.text_append') { if (typeof pl.text === 'string') streamed += pl.text; return null }
+      if (name === 'delta.message_done') {
+        const msgs = (pl.transcript?.messages || []).filter((m) => m.role === 'assistant')
+        let t = ''
+        for (const c of msgs[msgs.length - 1]?.content || []) if (c.type === 'text' && typeof c.text === 'string') t += c.text
+        final = t || streamed
+        this.messageDone = true
+        this.messageId = pl.message_id || this.messageId
+        return 'message'
+      }
+      if (name === 'task.status' && (!pl.root_agent_id || !pl.agent_id || pl.root_agent_id === pl.agent_id)) {
+        this.sawTask = true
+        if (TASK_END.has(pl.status)) { this.taskEnded = pl.status; return 'end' }
+      }
+      return null
+    },
+  }
+}
+
 export class MuseNoiseClient {
   constructor({ cookies, origin = 'https://muse.ai', ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36', log = () => {} } = {}) {
     this.cookieHeader = Array.isArray(cookies) ? cookies.map((c) => `${c.name}=${c.value}`).join('; ') : (cookies || '')
@@ -337,8 +394,10 @@ export class MuseNoiseClient {
     this.ws = null
     this.transport = null
     this.handlers = new Map() // streamId(string) -> {onFrame, onEnd}
-    this._settled = new Set() // streamIds whose handler already finished (ignore benign tails)
+    this._settled = new Set() // streamIds whose handler already finished (ignore benign tails); oldest dropped past 20k
     this._pumping = false
+    this.sessions = new Set() // session ids of turns running on this connection ('' = primary), for cancelAll()
+    this.closing = false // set by cancelAll(): no new turn starts on this connection
   }
   async rest(method, path, body) {
     const res = await fetch(this.origin + path, {
@@ -418,6 +477,7 @@ export class MuseNoiseClient {
     })
     this.ws = ws
     await this._handshake(ws)
+    this.lastFrameAt = Date.now()
     this._startPump()
     return true
   }
@@ -450,6 +510,7 @@ export class MuseNoiseClient {
       while (this._pumping) {
         const raw = await this._recv.next(0)
         if (raw === null || !this._pumping || !this.transport) break
+        this.lastFrameAt = Date.now()
         let frame = null
         try { frame = await this.transport.feedFrame(raw) } catch (e) { this.log('feedFrame error:', e.message, 'len', raw.length); continue }
         if (!frame) continue
@@ -459,9 +520,19 @@ export class MuseNoiseClient {
         else if (this._settled.has(key)) { /* stream already finished — ignore benign trailing body_chunk/response */ }
         else this.log('unhandled frame stream', key, 'kind', frame.kind && frame.kind.case)
       }
+      this._pumpEnded = true // from here a new request would never be answered: request()/chatSubscribe() fail fast
       for (const [, h] of this.handlers) { try { h.onEnd && h.onEnd() } catch {} }
     })()
   }
+  // Remember a finished stream so its late frames are ignored quietly — an ack we stopped waiting for (reset: false) still
+  // answers later. Drop the OLDEST past 20k: clearing the whole set at 1k (busy minutes) logged those as "unhandled frame".
+  _settle(key) {
+    this._settled.add(key)
+    if (this._settled.size > 20000) this._settled.delete(this._settled.values().next().value)
+  }
+  // The connection can still carry a request: open socket and a live frame pump. After a drop the pump has ended, so a
+  // request sent then got no onEnd and hung to its timeout (every `request timeout POST /fs/write` came ~60 s after a drop).
+  _live() { return !!(this.transport && this.ws && this.ws.readyState === 1 && this._pumping && !this._pumpEnded) }
   // Reset a stream we no longer read (best effort: a dead connection already freed it).
   _reset(streamId) {
     const t = this.transport
@@ -482,8 +553,11 @@ export class MuseNoiseClient {
     return streamId
   }
   // Unary request: resolve {status, headers, body} once end_body arrives.
-  request(method, path, { body, service = 0, headers = [], timeoutMs = 60000 } = {}) {
+  // `reset: false` keeps the stream open on the server when we stop waiting (the ack of a turn: resetting it can stop
+  // Muse from starting the turn we are about to follow)
+  request(method, path, { body, service = 0, headers = [], timeoutMs = 60000, reset = true } = {}) {
     if (!this.transport) return Promise.reject(new Error('not connected'))
+    if (!this._live()) return Promise.reject(new Error('stream closed before response'))
     const streamId = this._send(method, path, body, { service, headers })
     const key = String(streamId)
     return new Promise((resolve, reject) => {
@@ -495,12 +569,11 @@ export class MuseNoiseClient {
         if (settled) return; settled = true
         clearTimeout(timer); if (grace) clearTimeout(grace)
         this.handlers.delete(key)
-        if (this._settled.size > 1000) this._settled.clear()
-        this._settled.add(key)
+        this._settle(key)
         if (err) reject(err)
         else resolve({ status, headers: respHeaders, body: Buffer.from(concat(...(bodyParts.length ? bodyParts : [new Uint8Array(0)]))) })
       }
-      const timer = setTimeout(() => { this._reset(streamId); finish(new Error(`request timeout ${method} ${path}`)) }, timeoutMs)
+      const timer = setTimeout(() => { this.lastTimeoutAt = Date.now(); if (reset) this._reset(streamId); finish(new Error(`request timeout ${method} ${path}`)) }, timeoutMs)
       this.handlers.set(key, {
         onFrame: (frame) => {
           const kind = frame.kind
@@ -566,11 +639,12 @@ export class MuseNoiseClient {
   chatSubscribe({ capabilities = DEFAULT_CAPS, sessionId = null } = {}) {
     const body = { capabilities }
     if (sessionId) body.session_id = sessionId
-    const streamId = this._send('POST', '/chat/subscribe', body)
+    const live = this._live()
+    const streamId = live ? this._send('POST', '/chat/subscribe', body) : null
     const key = String(streamId)
     const q = []
     let notify = null
-    const state = { status: null, buf: new Uint8Array(0), closed: false, error: null }
+    const state = { status: null, buf: new Uint8Array(0), closed: !live, error: null } // dead connection: a closed feed
     const wake = () => { if (notify) { const n = notify; notify = null; n() } }
     const drainLines = () => {
       let nl
@@ -582,7 +656,7 @@ export class MuseNoiseClient {
         q.push(ev); wake()
       }
     }
-    this.handlers.set(key, {
+    if (live) this.handlers.set(key, {
       onFrame: (frame) => {
         const kind = frame.kind; if (!kind) return
         if (kind.case === 'reset') { state.error = new Error(`subscribe reset code=${Number(kind.value.code)} reason=${Buffer.from(kind.value.reason || new Uint8Array(0)).toString('utf8')}`); state.closed = true; wake(); return }
@@ -607,7 +681,7 @@ export class MuseNoiseClient {
       },
       stop: () => {
         if (!this.handlers.has(key)) return
-        this.handlers.delete(key); if (this._settled.size > 1000) this._settled.clear(); this._settled.add(key)
+        this.handlers.delete(key); this._settle(key)
         if (!state.closed) this._reset(streamId)
       },
     }
@@ -625,6 +699,43 @@ export class MuseNoiseClient {
       try { return await this._chatOnce(prompt, opts) }
       catch (e) {
         if (e.aborted) throw e
+        if (e.stalled && e.sessionId) {
+          // a side session that went quiet: ask Muse (task.status snapshot on a fresh feed). Finished → its reply from the
+          // history; still running → keep following it (once); otherwise cancel it so it stops running (and billing) on
+          // Muse and hand the turn to another account — rerunning it on this VM fed the VM's queue (sota 23/10)
+          const ts = await this.taskState(e.sessionId).catch(() => null)
+          let done = null
+          if (ts === 'completed') done = await this.sessionState(e.sessionId).then((st) => st.reply, () => null)
+          if (done !== null) {
+            this.log(`stalled session ${e.sessionId.slice(0, 8)} had finished: reply taken from its history`)
+            if (isMuseSorry(done)) throw museSorryError(done, e.sessionId)
+            return { ack: null, events: [], reply: done, replyReady: true, sessionId: e.sessionId, recovered: 'history' }
+          }
+          if (ts === 'running' && !e.fromResume && !(opts.signal && opts.signal.aborted)) {
+            this.log(`stalled session ${e.sessionId.slice(0, 8)} is still running per Muse: following it`)
+            let r
+            try { r = await this.resumeTurn(e.sessionId, { signal: opts.signal }) }
+            catch (re) {
+              if (!re.aborted) { const ok = await this.cancel(e.sessionId).catch(() => false); this.log(`following ${e.sessionId.slice(0, 8)} failed (${re.message}); cancelled → ${ok}`) }
+              re.noRetry = true // fail over; the connection is not to blame
+              throw re
+            }
+            if (isMuseSorry(r.reply)) throw museSorryError(r.reply, e.sessionId)
+            return { ack: null, events: [], reply: r.reply, replyReady: true, sessionId: e.sessionId, recovered: 'resume' }
+          }
+          if (ts && TASK_END.has(ts) && ts !== 'completed') { const se = new Error(`session ${ts}`); se.sessionStatus = ts; se.noRetry = true; throw se }
+          if (ts === null && !e.fromResume) {
+            // Muse could not even be asked on this connection: suspect the connection, not the session — resume it on a
+            // fresh one (the caller closes this one) instead of cancelling an answer that may be done
+            const ce = new Error(`${e.message}; no task.status on this connection — resuming on a fresh one`)
+            ce.resumeSessionId = e.sessionId
+            throw ce
+          }
+          const ok = await this.cancel(e.sessionId).catch(() => false)
+          this.log(`stalled session ${e.sessionId.slice(0, 8)} cancelled → ${ok}`)
+          e.noRetry = true
+          throw e
+        }
         const retryable = e.stalled || /^request timeout POST \/chat\/stream/.test(e.message || '')
         if (!retryable) throw e
         // an ack timeout on a reused session may have been delivered: only auto-retry fresh sessions or stalls before any event
@@ -636,6 +747,16 @@ export class MuseNoiseClient {
   }
   // Stop the turn running on Muse (the composer's stop button). Body = {session_id} for a side thread,
   // {} for the primary session; the reply is {cancelled: bool}.
+  // Muse can refuse the turn at the ack (23/10: `500 failed to resolve session_id` — no session is ever created); taking that
+  // as accepted waited 180 s for a first event and 180 s more resuming a session that does not exist before failing over.
+  _ackOk(ack, sid) {
+    if (!ack || ack.status < 300) return
+    const e = new Error(`chat.stream ${ack.status}: ${Buffer.from(ack.body || '').toString('utf8').slice(0, 200)}`)
+    e.noRetry = true // another account takes the turn; this connection is fine
+    e.ackRejected = true
+    if (sid) e.sessionId = sid
+    throw e
+  }
   async cancel(sessionId = null) {
     const r = await this.request('POST', '/chat/cancel', { body: sessionId ? { session_id: sessionId } : {}, timeoutMs: 15000 })
     let json = null
@@ -643,20 +764,48 @@ export class MuseNoiseClient {
     if (r.status !== 200) throw new Error(`chat.cancel ${r.status}: ${r.body.toString('utf8').slice(0, 200)}`)
     return !!(json && (json.cancelled ?? (json.result && json.result.cancelled)))
   }
-  async _chatOnce(prompt, { nodeId = crypto.randomUUID(), timeoutMs = 120000, onEvent, attachments = [], sessionId = null, newSession = false, signal = null } = {}) {
+  // Cancel every turn still running on this connection (shim shutdown/restart): Muse keeps running a turn whose
+  // connection closed and bills it to the end, while nobody can collect the reply any more.
+  async cancelAll(timeoutMs = 15000) {
+    this.closing = true
+    const sids = [...this.sessions]
+    const res = await Promise.all(sids.map((sid) => Promise.race([
+      this.cancel(sid || null).then((ok) => (ok ? 'cancelled' : 'not running'), (e) => 'error: ' + e.message),
+      new Promise((r) => setTimeout(() => r('timeout'), timeoutMs).unref()),
+    ])))
+    return sids.map((sid, i) => ({ sessionId: sid || null, result: res[i] }))
+  }
+  async _chatOnce(prompt, opts = {}) {
+    if (this.closing) throw abortedError() // shutting down: do not start a turn cancelAll() would miss
+    const sid = opts.newSession ? crypto.randomUUID() : (opts.sessionId || null)
+    const key = sid || ''
+    this.sessions.add(key)
+    try { return await this._chatTurn(prompt, { ...opts, sid }) } finally { this.sessions.delete(key) }
+  }
+  async _chatTurn(prompt, { nodeId = crypto.randomUUID(), timeoutMs = 120000, onEvent, attachments = [], sid = null, newSession = false, signal = null } = {}) {
     if (signal && signal.aborted) throw abortedError()
     let text = prompt
     for (const a of attachments) { const alt = String(a.name || '').replace(/[\]\[]/g, ''); text += `\n![${alt}](${a.uri})` }
-    const sid = newSession ? crypto.randomUUID() : sessionId
     const body = { items: [{ type: 'text', text }], node_id: nodeId, capabilities: DEFAULT_CAPS }
     if (sid) body.session_id = sid
     let ack, sub
+    const ackMs = Number(process.env.MUSE_ACK_TIMEOUT_MS ?? 30000)
     if (newSession) {
-      ack = await this.request('POST', '/chat/stream', { body, timeoutMs: 30000 })
+      try { ack = await this.request('POST', '/chat/stream', { body, timeoutMs: ackMs, reset: false }); this._ackOk(ack, sid) }
+      catch (e) {
+        // no ack in time: on a busy VM the turn is queued, not lost — follow its session (the stall window below still
+        // bounds the wait) instead of starting a second session while the first one runs and bills anyway
+        if (!/^request timeout/.test(e.message || '')) throw e
+        this.log(`no ack for session ${sid.slice(0, 8)} in ${Math.round(ackMs / 1000)} s — following it instead of resending`)
+        const stallFirstMs = Number(process.env.MUSE_STALL_FIRST_MS ?? 180000)
+        const r = await this.resumeTurn(sid, { signal, stallMs: stallFirstMs })
+        if (isMuseSorry(r.reply)) throw museSorryError(r.reply, sid)
+        return { ack: null, events: [], reply: r.reply, replyReady: true, assistantMessageId: null, sessionId: sid }
+      }
       sub = this.chatSubscribe({ sessionId: sid })
     } else {
       sub = this.chatSubscribe({ sessionId: sid })
-      try { ack = await this.request('POST', '/chat/stream', { body, timeoutMs: 30000 }) } catch (e) { sub.stop(); throw e }
+      try { ack = await this.request('POST', '/chat/stream', { body, timeoutMs: ackMs }); this._ackOk(ack, sid) } catch (e) { sub.stop(); throw e }
     }
     const events = []
     const backstop = Date.now() + Number(process.env.MUSE_MAX_TURN_MS ?? 1800000) // absolute ceiling (max total turn)
@@ -664,7 +813,16 @@ export class MuseNoiseClient {
     const idleAfterFirst = timeoutMs && timeoutMs > 0 ? timeoutMs : stallIdle // timeoutMs now = idle gap between events
     let lastEv = Date.now()
     let idleWindow = stallFirst // sliding: tolerated silence; extends as long as events keep arriving
-    let reply = '', replyReady = false, assistantMessageId = null
+    const tr = turnTracker()
+    let replyReady = false, ownCount = 0, lastQuiet = 0
+    const quietMemo = {}
+    const stalled = () => {
+      sub.stop()
+      const e = new Error(`stalled: no event for ${Math.round((Date.now() - lastEv) / 1000)}s (${ownCount} events so far)`)
+      e.stalled = true
+      if (sid) e.sessionId = sid
+      return e
+    }
     while (Date.now() < backstop) {
       if (signal && signal.aborted) {
         // caller is gone: stop Muse generating instead of letting it burn quota to the end
@@ -674,35 +832,202 @@ export class MuseNoiseClient {
         throw abortedError()
       }
       const ev = await sub.nextEvent(Math.max(50, Math.min(idleWindow - (Date.now() - lastEv), backstop - Date.now(), 5000)))
-      if (ev === null) {
-        if (sub.isClosed() || sub.getError()) break
-        if (Date.now() - lastEv > idleWindow) {
-          sub.stop()
-          const e = new Error(`stalled: no event for ${Math.round((Date.now() - lastEv) / 1000)}s (${events.length} events so far)`)
-          e.stalled = true
-          throw e
+      if (ev === null && (sub.isClosed() || sub.getError())) break
+      if (ev) {
+        events.push(ev)
+        if (ownEvent(ev, sid)) {
+          if (onEvent) onEvent(ev)
+          if (DEBUG_TURN) { const n = ev.event || ev.event_name; if (n !== 'delta.text_append') this.log(`turn ${String(sid).slice(0, 8)} ev ${n} ${n === 'task.status' ? ev.payload?.status : ''}`) }
+          idleWindow = ownCount ? idleAfterFirst : stallFirst // slide the idle window on the session's own events only
+          lastEv = Date.now()
+          ownCount++
+          if (tr.feed(ev) === 'end') {
+            // task.status can overtake the last message's deltas (a 3.7k-char JSON came back cut mid-string): read on until
+            // that message closes, then ask the history, and only then decide
+            const until = Date.now() + 30000
+            while (!tr.messageDone && Date.now() < until) {
+              const more = await sub.nextEvent(Math.max(50, until - Date.now()))
+              if (!more) break
+              events.push(more)
+              if (!ownEvent(more, sid)) continue
+              if (onEvent) onEvent(more)
+              tr.feed(more)
+            }
+            if (!tr.messageDone && sid) {
+              const st = await this.sessionState(sid).catch((e) => (e.sessionStatus ? { err: e } : null))
+              if (st?.err) throw st.err // Muse errored / interrupted the session: noRetry, the turn fails over
+              if (st && st.reply !== null) tr.final = st.reply
+            }
+            if (!tr.messageDone) {
+              // Muse closed the task with no reply at all (a session `errored` at birth): an error, not an empty answer
+              this.log(`turn ${String(sid || 'primary').slice(0, 8)} ended (${tr.taskEnded}) without a reply after ${events.length} events`)
+              const e = new Error(`Muse ended the turn (${tr.taskEnded}) without a reply`)
+              e.noRetry = true
+              e.museError = true
+              throw e
+            }
+            replyReady = true
+            break
+          }
+          continue
         }
+      }
+      // nothing from this session lately (null, or another session's / a job's broadcast): the quiet checks run either way
+      if (tr.messageDone && !tr.sawTask && Date.now() - lastEv > DONE_GRACE_MS) {
+        // no task.status on this feed: Muse says whether that message was the answer or a commentary
+        let done = null, unknown = !sid
+        if (sid) { try { done = await this.finishedReply(sid) } catch (e) { if (e.sessionStatus) throw e; unknown = true } }
+        if (unknown) { replyReady = true; break } // primary session / Muse unreadable: take what the feed gave
+        if (done !== null) { tr.final = done; replyReady = true; break }
+        lastEv = Date.now() // the turn still runs: wait another grace
         continue
       }
-      lastEv = Date.now()
-      idleWindow = events.length ? idleAfterFirst : stallFirst // slide the idle window on every event (don't cut off active streaming)
-      events.push(ev)
-      if (onEvent) onEvent(ev)
-      const name = ev.event || ev.event_name
-      if (name === 'delta.text_append') { const t = ev.payload && ev.payload.text; if (typeof t === 'string') reply += t }
-      else if (name === 'delta.message_done') {
-        assistantMessageId = (ev.payload && ev.payload.message_id) || assistantMessageId
-        const tr = ev.payload && ev.payload.transcript
-        let final = ''
-        if (tr && Array.isArray(tr.messages)) for (const m of tr.messages) if (m.role === 'assistant' && Array.isArray(m.content)) for (const c of m.content) if (c.type === 'text' && typeof c.text === 'string') final += c.text
-        if (final) reply = final
-        replyReady = true
-        break
+      if (sid && ownCount && Date.now() - lastEv >= 30000 && Date.now() - lastQuiet >= 30000) {
+        lastQuiet = Date.now()
+        const done = await this.quietCheck(sid, quietMemo)
+        if (done !== null) { this.log(`turn ${sid.slice(0, 8)}: feed quiet, Muse says done — reply from its history`); tr.final = done; replyReady = true; break }
       }
+      if (Date.now() - lastEv > idleWindow) throw stalled()
     }
+    const reply = tr.reply, assistantMessageId = tr.messageId
     sub.stop()
+    if (!replyReady && (sub.isClosed() || sub.getError())) {
+      // the connection dropped mid-turn: Muse keeps running the session, so the caller picks it up on a fresh connection
+      // (resumeTurn) instead of taking the cut-off text as the reply — that failed the schema check and re-ran the turn
+      // while the first run went on, billed, for nobody (~100 such per 40 min on 23/10)
+      const why = sub.getError() ? ` (${sub.getError().message})` : ''
+      const e = new Error(`stream closed mid-turn after ${events.length} events${why}`)
+      if (sid) e.resumeSessionId = sid
+      throw e
+    }
     if (isMuseSorry(reply)) throw museSorryError(reply, sid)
     return { ack, events, reply, replyReady, assistantMessageId, sessionId: sid }
+  }
+  // Final reply of a side session from its history, or null while it is still running. Mid-stream the history already
+  // holds a partial `message.assistant` (payload.metadata.streaming) — only payload.status "completed" marks it done.
+  // Muse's own word on whether a turn is over: a fresh feed opens with a task.status snapshot (running / completed), and
+  // shows nothing while the session does not exist. The history alone cannot tell: the finished FIRST message of a
+  // two-message answer ("Mình sẽ xem ảnh…" then the JSON) reads like a complete reply.
+  async taskState(sid, waitMs = 5000) {
+    const sub = this.chatSubscribe({ sessionId: sid })
+    try {
+      const until = Date.now() + waitMs
+      while (Date.now() < until) {
+        const ev = await sub.nextEvent(Math.max(50, until - Date.now()))
+        if (!ev) break
+        const pl = ev.payload || {}
+        if ((ev.event || ev.event_name) === 'task.status' && ownEvent(ev, sid) && (!pl.root_agent_id || !pl.agent_id || pl.root_agent_id === pl.agent_id)) return pl.status || null
+      }
+      return null
+    } finally {
+      sub.stop()
+    }
+  }
+  // A turn whose feed went quiet: ask Muse directly instead of trusting the feed (23/10: a feed showed `running`, then lost
+  // the session's events — 7 sessions completed with their replies while their resumes waited 180 s). A fresh task.status
+  // snapshot decides; when even that is unreadable, a history reply that reads the same twice (memo.prev) is taken.
+  // → reply (done) | null (running / unknown); throws (noRetry) when Muse ended the session otherwise.
+  async quietCheck(sid, memo) {
+    const ts = await this.taskState(sid).catch(() => null)
+    if (ts === 'completed') {
+      const st = await this.sessionState(sid).catch((e) => { if (e.sessionStatus) throw e; return null })
+      if (st && st.reply !== null) return st.reply
+    } else if (ts && TASK_END.has(ts)) {
+      const e = new Error(`session ${ts}`); e.sessionStatus = ts; e.noRetry = true; throw e
+    } else if (ts === null) {
+      let st = null
+      try { st = await this.sessionState(sid); memo.fails = 0 } catch (e) { if (e.sessionStatus) throw e; memo.fails = (memo.fails || 0) + 1 }
+      if (st && st.reply !== null && st.reply === memo.prev) return st.reply
+      memo.prev = st ? st.reply : undefined
+    }
+    return null
+  }
+  // Reply of a turn Muse has closed, from its history; null while it still runs (or does not exist). Throws (noRetry)
+  // when Muse ended it otherwise.
+  async finishedReply(sid) {
+    const ts = await this.taskState(sid)
+    if (!ts || !TASK_END.has(ts)) return null
+    if (ts !== 'completed') { const e = new Error(`session ${ts}`); e.sessionStatus = ts; e.noRetry = true; throw e }
+    return (await this.sessionState(sid)).reply
+  }
+  // {exists: Muse has the session (its user message), reply: final text or null while running}; throws (noRetry) when
+  // Muse ended it otherwise (errored / interrupted)
+  async sessionState(sid) {
+    const r = await this.request('GET', `/chat/history?limit=10&session_id=${encodeURIComponent(sid)}`, { timeoutMs: 30000 })
+    if (r.status === 404) return { exists: false, reply: null } // Muse has not created the session (yet)
+    if (r.status !== 200) throw new Error(`chat.history ${r.status}`)
+    const evs = JSON.parse(r.body.toString('utf8')).result?.chat_events || []
+    const kind = (e) => e.event_name || e.event
+    const last = evs.filter((e) => kind(e) === 'message.assistant').pop()
+    const st = last?.payload?.status
+    if (st && st !== 'completed') { const e = new Error(`session ${st}`); e.sessionStatus = st; e.noRetry = true; throw e }
+    // a closing commentary ("I'll open the attached image…") means the answer is still to come
+    const answered = st && last.payload?.metadata?.message_kind !== 'commentary'
+    return { exists: evs.some((e) => kind(e) === 'message.user'), reply: answered ? String(last.payload.content ?? last.display_text ?? '') : null }
+  }
+  // Pick up a turn whose connection dropped: subscribe to its session on this (fresh) connection and wait for
+  // message_done — its transcript carries the whole reply even though the deltas sent while we were away are gone —
+  // and read the history every 30 s, which has the reply if the session finished before we resubscribed.
+  async resumeTurn(sid, { signal = null, stallMs = Number(process.env.MUSE_STALL_FIRST_MS ?? 180000), maxMs = Number(process.env.MUSE_MAX_TURN_MS ?? 1800000) } = {}) {
+    if (this.closing) throw abortedError()
+    this.sessions.add(sid)
+    let sub = this.chatSubscribe({ sessionId: sid })
+    const tr = turnTracker()
+    try {
+      const t0 = Date.now()
+      let lastEv = Date.now(), lastProbe = Date.now(), lastHist = Date.now(), own = 0
+      const memo = {}
+      while (Date.now() - t0 < maxMs) {
+        if (signal && signal.aborted) {
+          await this.cancel(sid).catch(() => false)
+          throw abortedError()
+        }
+        const ev = await sub.nextEvent(5000)
+        if (ev === null && (sub.isClosed() || sub.getError())) { const e = new Error('stream closed while resuming'); e.resumeSessionId = sid; throw e }
+        if (ev && ownEvent(ev, sid)) {
+          lastEv = Date.now()
+          own++
+          if (tr.feed(ev) === 'end') {
+            if (tr.messageDone) return { reply: tr.reply, replyReady: true, sessionId: sid, via: 'stream' }
+            // we joined after the answer (the snapshot already says the task is over): its last message is in the history
+            if (tr.taskEnded !== 'completed') { const e = new Error(`session ${tr.taskEnded}`); e.sessionStatus = tr.taskEnded; e.noRetry = true; throw e }
+            let st = null
+            for (let k = 0; k < 3 && !st; k++) {
+              try { st = await this.sessionState(sid) } catch (e) { if (e.sessionStatus) throw e; this.log(`resume ${sid.slice(0, 8)}: history read failed (${e.message})`); await new Promise((r) => setTimeout(r, 2000 * (k + 1))) }
+            }
+            if (st && st.reply !== null) return { reply: st.reply, replyReady: true, sessionId: sid, via: 'history' }
+            const e = new Error(st ? 'Muse ended the turn without a reply' : 'resume: history unreadable after the turn ended')
+            e.noRetry = !!st
+            throw e
+          }
+          continue
+        }
+        // nothing from this session lately (null, or a broadcast about other sessions / jobs): the quiet checks run either way.
+        // The stall check comes FIRST: each pass (5 s wait + quietCheck) outlasts the 10-s reopen, and a reopen that
+        // `continue`d before it skipped the stall check for good — resumes on sessions Muse never had looped to the 30-min cap
+        if (Date.now() - lastEv > stallMs) { const e = new Error(`resume stalled: no event for ${Math.round(stallMs / 1000)}s`); e.stalled = true; e.sessionId = sid; e.fromResume = true; throw e }
+        // the feed has said nothing about this session for 20 s (23/10: a feed on a session Muse had interrupted stayed
+        // silent 180 s while the connection served other turns): ask the history every 10 s — an interrupted / errored
+        // session fails over now, and an answer that reads the same twice is taken (both messages of a two-message
+        // answer land within seconds)
+        if (Date.now() - lastEv >= 20000 && Date.now() - lastHist >= 10000) {
+          lastHist = Date.now()
+          const done = await this.quietCheck(sid, memo)
+          if (done !== null) return { reply: done, replyReady: true, sessionId: sid, via: 'history' }
+          // feed silent AND reads unanswered: the connection is the problem (23/10 pedropereira: 3 sessions completed
+          // with their replies while the resume waited 180 s on it) — have the caller resume on a fresh connection
+          if (memo.fails >= 2 && !own) { const ce = new Error('connection unresponsive while resuming'); ce.resumeSessionId = sid; throw ce }
+        }
+        // no task.status yet: the feed was opened before Muse created the session — reopen it every 10 s, a feed on an
+        // existing session starts with the task.status snapshot (running / completed)
+        if (!tr.sawTask && Date.now() - lastProbe >= 10000) { lastProbe = Date.now(); sub.stop(); sub = this.chatSubscribe({ sessionId: sid }) }
+        if (tr.messageDone && !tr.sawTask && Date.now() - lastEv > DONE_GRACE_MS) return { reply: tr.reply, replyReady: true, sessionId: sid, via: 'stream' } // Muse sends no task.status here
+      }
+      const e = new Error('resume: turn ran past MUSE_MAX_TURN_MS'); e.stalled = true; e.sessionId = sid; e.fromResume = true; throw e
+    } finally {
+      sub.stop()
+      this.sessions.delete(sid)
+    }
   }
   close() { this._pumping = false; try { this.ws?.close() } catch {} this.ws = null; this.transport = null }
 }

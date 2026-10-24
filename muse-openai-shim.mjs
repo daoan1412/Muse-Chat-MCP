@@ -220,7 +220,9 @@ async function runStructured(basePrompt, rfInfo, validate, opts) {
     if (!ex.ok) {
       last = { raw: r.reply, errors: ['reply is not valid JSON'] }
       prompt = basePrompt + corrective(last.errors, rfInfo)
-      log(`schema attempt ${attempt}: parse-fail`)
+      // what the unparseable reply looked like (cut off? prose around the JSON?) — 4,9% of first attempts on 23/10
+      const raw = String(r.reply || '')
+      log(`schema attempt ${attempt}: parse-fail (${raw.length} chars${r.timedOut ? ', timed out' : ''}${r.account ? `, ${r.account}` : ''}: ${JSON.stringify(raw.slice(0, 80))} … ${JSON.stringify(raw.slice(-80))})`)
       continue
     }
     if (validate) {
@@ -315,7 +317,19 @@ function beginStream(res) {
 
 // ---------------------------------------------------------------- handler
 
+// Chat requests in progress (their AbortControllers) and the shutdown latch: on SIGTERM the server aborts them all, which
+// runs the same path as a caller hanging up — the transport cancels each Muse turn instead of leaving it running unpaid-for.
+const openChats = new Set()
+let draining = false
+export function abortAllChats() {
+  draining = true
+  const n = openChats.size // each abort removes its own entry
+  for (const ac of [...openChats]) ac.abort()
+  return n
+}
+
 async function handleChat(req, res, body) {
+  if (draining) return sendError(res, 503, 'Muse shim is restarting — retry shortly', 'server_error')
   if (!body || typeof body !== 'object') return sendError(res, 400, 'Invalid request body')
   if (!body.model) return sendError(res, 400, 'Missing required field: model', 'invalid_request_error', null, 'model')
   if (!Array.isArray(body.messages) || !body.messages.length) {
@@ -348,6 +362,9 @@ async function handleChat(req, res, body) {
   const ac = new AbortController()
   res.on('close', () => { if (!res.writableFinished) ac.abort() })
   const signal = ac.signal
+  openChats.add(ac)
+  signal.addEventListener('abort', () => openChats.delete(ac), { once: true })
+  res.on('close', () => openChats.delete(ac))
 
   log(`chat model=${model} stream=${stream} tools=${wantTools} files=${files.length} target=${chat !== undefined ? chat : 'current'} account=${account || 'auto'} promptChars=${prompt.length}`)
 

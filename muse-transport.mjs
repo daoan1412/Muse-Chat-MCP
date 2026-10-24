@@ -22,7 +22,7 @@ import fs, { promises as fsp } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { accountCreds, loadDotEnv } from './muse-env.mjs'
 import { driver, MuseDriver, clearStaleSingleton } from './muse-driver.mjs'
-import { MuseNoiseClient, abortedError } from './muse-noise.mjs'
+import { MuseNoiseClient, abortedError, isMuseSorry, museSorryError } from './muse-noise.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PROFILE_DIR = process.env.MUSE_PROFILE_DIR || path.join(__dirname, 'accounts', 'acc1')
@@ -171,6 +171,10 @@ class NoiseTransport {
     this.pausedMtime = -1
     this._loadPaused()
     this.quotaEveryMs = Math.max(0, Number(process.env.MUSE_QUOTA_CHECK_SEC ?? 120)) * 1000
+    // zombie-connection watchdog: an open WebSocket that stopped delivering anything while turns wait on it (23/10: turns
+    // sat 12 min on a connection that had gone silent while fresh connections served the same sessions)
+    this.zombieMs = Math.max(0, Number(process.env.MUSE_ZOMBIE_SEC ?? 45)) * 1000
+    if (this.zombieMs) setInterval(() => { this._checkZombies().catch(() => {}) }, 15000).unref()
     if (this.quotaEveryMs) setInterval(() => { this._checkQuotas().catch(() => {}) }, this.quotaEveryMs).unref()
     entries.filter((e) => e !== '*').forEach((e, i) => {
       const eq = e.indexOf('=')
@@ -255,14 +259,25 @@ class NoiseTransport {
     if (!a) throw new Error(`unknown account "${id}" (known: ${this.order.join(', ')})`)
     return a
   }
+  // One cookie read per account at a time, shared by every caller: two Chromium on one profile collide (ProcessSingleton),
+  // and a console usage read racing a reconnect failed the whole batch of turns waiting on that connect (693 failovers/24 h).
+  _grabCookies(a) {
+    if (!a.grabbing) {
+      a.grabbing = grabCookies(a.profileDir)
+        .then((c) => (a.cookies = c))
+        .finally(() => { a.grabbing = null })
+    }
+    return a.grabbing
+  }
   async _ensure(a) {
+    if (this.closing) throw abortedError() // shutting down: no reconnect, no failover onto a fresh connection
     if (a.client && a.client.ws && a.client.ws.readyState === 1) return a.client
     if (a.client) { try { a.client.close() } catch {}; a.client = null } // stale/closed -> drop it
     if (a.connecting) return a.connecting // dedupe concurrent callers (one cookie-grab / connect)
     a.connecting = (async () => {
       try {
-        if (!a.cookies) a.cookies = await grabCookies(a.profileDir)
-        const c = new MuseNoiseClient({ cookies: a.cookies, log })
+        const cookies = a.cookies || await this._grabCookies(a)
+        const c = new MuseNoiseClient({ cookies, log })
         await c.connect()
         a.client = c
         if (this.quotaEveryMs && !a.quota) this._checkQuota(a) // first connect: learn the quota before many turns land here
@@ -305,6 +320,7 @@ class NoiseTransport {
     // none are cached yet and unattended credentials are supplied, drive a
     // one-shot browser sign-in (mailtemp OTP) into that profile to seed it.
     const a = this._acct(opts.account)
+    if (a.grabbing) await a.grabbing.catch(() => {}) // the seed browser below needs the profile to itself
     if (!a.cookies) {
       const creds = a.creds
       const email = opts.email || creds.email
@@ -383,11 +399,54 @@ class NoiseTransport {
         throw err
       }
     }
-    for (let attempt = 0; attempt < 2; attempt++) {
+    let resumeSid = null // session of a turn whose connection dropped mid-reply: the next attempt picks it up, not a rerun
+    let attachments = [], resumes = 0
+    // two runs of the turn at most, plus up to two resumes of a run whose connection dropped (or went unresponsive)
+    for (let attempt = 0; attempt < 4; attempt++) {
       if (signal && signal.aborted) throw abortedError()
-      const client = await this._ensure(a)
+      let client
+      for (let k = 0; ; k++) {
+        try { client = await this._ensure(a); break }
+        catch (e) {
+          // the gateway's WS 502/429 come in short bursts: a turn that only has to pick its running session up retries
+          // the connection instead of failing over and leaving that session to run for nobody
+          if (!resumeSid || e.aborted || k >= 3 || (signal && signal.aborted)) throw e
+          log(`resume of ${resumeSid.slice(0, 8)} on ${a.id}: connect failed (${e.message}), retrying`)
+          await sleep(3000 * (k + 1))
+        }
+      }
       try {
-        const attachments = await this._uploadAll(client, files, signal) // fresh copies each attempt: the VM may have restarted
+        if (resumeSid) {
+          let r
+          resumes++
+          try { r = await client.resumeTurn(resumeSid, { signal }) }
+          catch (e) {
+            if (!e.aborted && e.resumeSessionId && resumes < 2) {
+              // this connection died / stopped answering too: resume once more on a fresh one
+              log(`resume of ${resumeSid.slice(0, 8)} on ${a.id}: ${e.message} — reconnecting to resume again`)
+              try { client.close() } catch {}
+              if (a.client === client) a.client = null
+              continue
+            }
+            // the session cannot be picked up (stalled, errored, connection lost again): cancel it so Muse stops billing
+            // it, then fail over — without closing this connection, which carries the account's other turns
+            if (!e.aborted) {
+              const sid = resumeSid
+              ;(clientLive(client) ? Promise.resolve(client) : this._ensure(a)).then((c) => c.cancel(sid))
+                .then((ok) => log(`resume of ${sid.slice(0, 8)} on ${a.id} failed (${e.message}); cancelled → ${ok}`), () => {})
+            }
+            e.noRetry = true
+            throw e
+          }
+          log(`resumed turn ${resumeSid.slice(0, 8)} on ${a.id} after a dropped connection (reply from ${r.via})`)
+          if (isMuseSorry(r.reply)) throw museSorryError(r.reply, resumeSid)
+          return {
+            reply: r.reply, messages: r.reply ? [r.reply] : [], threadUrl: APP_URL, elapsedMs: Date.now() - t0,
+            transport: 'noise', account: a.id, sessionId: resumeSid, resumed: true,
+            ...(attachments.length ? { attachments } : {}),
+          }
+        }
+        attachments = await this._uploadAll(client, files, signal) // fresh copies each attempt: the VM may have restarted
         let committed = ''
         const r = await client.chat(prompt, {
           timeoutMs: opts.timeoutMs || Number(process.env.MUSE_STALL_IDLE_MS || 120000), // idle gap between events (activity-based; see _chatOnce)
@@ -417,11 +476,18 @@ class NoiseTransport {
       } catch (e) {
         if (e.noRetry || e.aborted) throw e // Muse itself reported an error (or the caller left): return it as-is
         log('chat attempt', attempt, 'failed:', e.message)
-        if (!(e.upload && clientLive(client))) { // an upload failure on a live connection leaves it to the other turns
-          try { a.client?.close() } catch {}
-          a.client = null // keep cookies; force a fresh connection on retry
+        const resume = !!(e.resumeSessionId && !resumeSid)
+        if (resume) resumeSid = e.resumeSessionId // next pass picks the running session up instead of a rerun
+        // an upload failure on a live connection leaves it to the other turns; a reset feed does not: the gateway resets
+        // every feed of a connection whose VM side failed at once (`subscribe reset code=5 reason=response body error`,
+        // 10 feeds in the same second on 23/10) and a resume on that connection got reset again — reconnect instead
+        if (!(e.upload && clientLive(client))) {
+          // close the connection THIS attempt used: after a retry backoff (chat 2–4.5 s, upload 1.5–3 s) `a.client` may
+          // already be the fresh one another turn opened, and closing that one took every turn on it down too
+          try { client.close() } catch {}
+          if (a.client === client) a.client = null // keep cookies; force a fresh connection on retry
         }
-        if (attempt === 1) throw e
+        if (attempt >= 1 && !resume) throw e
       }
     }
   }
@@ -526,11 +592,21 @@ class NoiseTransport {
         // hold a place while waiting, or least_conn sends every turn arriving meanwhile to this same account (a herd of
         // ~80 turns uploading at once on one connection drops it within 2 s, then moves on to the next account)
         a.inflight = (a.inflight || 0) + 1
-        try { await this._ensure(a); await this._checkQuota(a) } catch (e) { a.quotaError = e.message }
+        // the meter is plain HTTPS with the login cookies: read it without waiting on the VM connection, which may be
+        // failing (WS 502 right after a restart let turns through to DEPLETED accounts while their meter went unread)
+        try {
+          if (!a.cookies && !a.client) await this._grabCookies(a)
+          // a read can fail on a burst (28 reads at start: `fetch failed`, 14 turns then ran on a DEPLETED account): retry
+          for (let k = 0; k < 3 && !a.quota; k++) { if (k) await sleep(1000 * k); await this._checkQuota(a) }
+        } catch (e) { a.quotaError = e.message }
         finally { a.inflight = Math.max(0, (a.inflight || 0) - 1) }
         if (opts.signal && opts.signal.aborted) throw abortedError()
-        if (this._depleted(a)) continue
       }
+      // `cands` was ranked when the request came in: an account found out of quota (or paused) since then is skipped, or
+      // a failover lands on it — right after a restart every meter is unread, so a 429 wave sent ~60 turns onto DEPLETED ones
+      if (this._depleted(a) || this.paused.has(a.id)) continue
+      // meter still unreadable: let another account take the turn if there is one
+      if (this.quotaEveryMs && !a.quota && a !== cands[cands.length - 1]) continue
       tried++
       try { return await this._turn(a, prompt, opts) }
       catch (e) {
@@ -620,16 +696,50 @@ class NoiseTransport {
   async usage(opts = {}) {
     const a = this._acct(opts.account)
     let c = a.client
-    if (!c) {
-      if (!a.cookies) a.cookies = await grabCookies(a.profileDir)
-      c = new MuseNoiseClient({ cookies: a.cookies, log })
-    }
+    if (!c) c = new MuseNoiseClient({ cookies: a.cookies || await this._grabCookies(a), log })
     const sub = await c.usage()
     this._noteQuota(a, sub) // a caller's read (console, muse_usage) refreshes the quota guard too
     return { ...sub, account: a.id, transport: 'noise' }
   }
   async dumpDom(max, opts = {}) { return { note: 'dump_dom is a browser-only diagnostic (noise transport has no DOM)', transport: 'noise' } }
   async close(opts = {}) { for (const a of this.accounts.values()) { try { a.client?.close() } catch {} a.client = null } }
+  // A connection with turns in flight and no frame for zombieMs gets a cheap read; no answer in 20 s → close it, which ends
+  // every feed on it as "stream closed" and the turns resume their sessions on a fresh connection.
+  async _checkZombies() {
+    if (this.closing) return
+    for (const a of this.accounts.values()) {
+      const c = a.client
+      if (!clientLive(c) || !(a.inflight > 0) || a.zombieProbe) continue
+      // silent, or still delivering broadcasts but leaving requests unanswered (a recent request timeout)
+      const silent = Date.now() - (c.lastFrameAt || 0) >= this.zombieMs
+      const unanswered = c.lastTimeoutAt && Date.now() - c.lastTimeoutAt < 60000
+      if (!silent && !unanswered) continue
+      a.zombieProbe = true
+      c.request('GET', '/chat/history?limit=1', { timeoutMs: 20000 })
+        .then(() => {}, (e) => {
+          if (c !== a.client || !clientLive(c)) return
+          log(`zombie connection on ${a.id}: ${silent ? `no frame for ${Math.round((Date.now() - c.lastFrameAt) / 1000)} s` : 'requests timing out'} and the probe failed (${e.message}) — closing it, ${a.inflight} turn(s) will resume`)
+          try { c.close() } catch {}
+          if (a.client === c) a.client = null
+        })
+        .finally(() => { a.zombieProbe = false })
+    }
+  }
+  // Shim shutdown/restart: the HTTP layer has aborted every turn (each cancels its own Muse session on the way out);
+  // wait up to waitMs for them to finish, then cancel whatever is still running on any connection before close().
+  async shutdown({ waitMs = 45000 } = {}) {
+    this.closing = true
+    const busy = () => [...this.accounts.values()].reduce((n, a) => n + (a.inflight || 0), 0)
+    const t0 = Date.now()
+    while (busy() && Date.now() - t0 < waitMs) await sleep(250)
+    const left = busy()
+    const swept = []
+    await Promise.all([...this.accounts.values()].filter((a) => a.client && a.client.sessions?.size).map(async (a) => {
+      for (const r of await a.client.cancelAll()) swept.push(`${a.id}:${(r.sessionId || 'primary').slice(0, 8)}=${r.result}`)
+    }))
+    log(`shutdown: turns settled in ${Math.round((Date.now() - t0) / 1000)} s${left ? ` (${left} still in flight)` : ''}; ${swept.length ? `cancelled leftover sessions: ${swept.join(', ')}` : 'no session left running'}`)
+    return { inflightLeft: left, swept }
+  }
 }
 
 export const transport = TRANSPORT === 'noise' ? new NoiseTransport() : driver

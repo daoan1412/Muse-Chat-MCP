@@ -27,7 +27,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import { transport } from './muse-transport.mjs'
-import { startShim } from './muse-openai-shim.mjs'
+import { startShim, abortAllChats } from './muse-openai-shim.mjs'
 
 const log = (...a) => console.error('[muse-mcp]', ...a)
 const asText = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] })
@@ -245,7 +245,12 @@ async function main() {
     shuttingDown = true
     if (httpServer) {
       try { httpServer.close() } catch {}
-      setTimeout(() => { try { httpServer.closeAllConnections?.() } catch {} }, 2000).unref()
+      // cancel every running turn BEFORE closing the connections: a turn whose connection just closes keeps running on
+      // Muse and is billed to the end while its caller has already moved on (systemd TimeoutStopSec 90 s)
+      const n = abortAllChats()
+      if (n) console.error(`[muse-server] shutdown: cancelling ${n} running turn(s)`)
+      if (typeof transport.shutdown === 'function') await transport.shutdown().catch((e) => console.error('[muse-server] shutdown:', e.message))
+      try { httpServer.closeAllConnections?.() } catch {}
     }
     await transport.close().catch(() => {})
     process.exit(0)
