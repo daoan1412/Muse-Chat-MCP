@@ -154,7 +154,7 @@ function quotaExhausted(accts) {
 // ~2,000 failovers/hour onto them). The profile's cookies are dead; only a new sign-in brings the account back.
 const SESSION_EXPIRED_RE = /hatchAdmissionInvalidated|session has expired|Authentication required|requires a web checkpoint|not logged in \(auth\/check/i
 const sessionExpired = (e) => SESSION_EXPIRED_RE.test((e && e.message) || String(e || ''))
-const hasLoginCreds = (c) => !!(c.email && (c.metaPassword || c.mailPassword || c.apiKey || c.mailToken || /generator\.email|luuvan\.site/i.test(c.otpUrl || '')))
+const hasLoginCreds = (c) => !!(c.email && (c.metaPassword || c.mailPassword || c.apiKey || c.mailToken || /generator\.email|luuvan\.site|tuan89\.site/i.test(c.otpUrl || '')))
 
 class NoiseTransport {
   constructor() {
@@ -409,7 +409,7 @@ class NoiseTransport {
       const apiKey = opts.apiKey || creds.apiKey
       const mailToken = opts.mailToken || creds.mailToken
       const otpUrl = opts.otpUrl || creds.otpUrl
-      const hasCreds = !!(metaPassword || mailPassword || apiKey || mailToken || /generator\.email|luuvan\.site/i.test(otpUrl || ''))
+      const hasCreds = !!(metaPassword || mailPassword || apiKey || mailToken || /generator\.email|luuvan\.site|tuan89\.site/i.test(otpUrl || ''))
       if (email && hasCreds && opts.auto !== false) {
         const d = new MuseDriver(a.profileDir)
         try {

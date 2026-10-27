@@ -24,7 +24,7 @@ See `README.md` for usage.
   `MUSE_ACCOUNTS_DIR`, re-scanned at most every `MUSE_ACCOUNTS_RESCAN_SEC` by `_rescan`; base `MUSE_ACCOUNTS_DIR`):
   one `MuseNoiseClient` per account, `grabCookies(profileDir)`.
 - `muse-driver.mjs` — browser driver (selectors, `_run`/`chat`/`chatStream`, `_serial`, `usage`,
-  `login` = unattended Meta sign-in via `muse-mailtemp.mjs` (or `muse-genmail.mjs` / `muse-luuvan.mjs` when `OTP_URL` is generator.email / luuvan.site) when creds present, else manual wait);
+  `login` = unattended Meta sign-in via `muse-mailtemp.mjs` (or `muse-genmail.mjs` / `muse-luuvan.mjs` / `muse-tuan89.mjs` when `OTP_URL` is generator.email / luuvan.site / tuan89.site) when creds present, else manual wait);
   `clearStaleSingleton()` unlinks Chrome's `Singleton{Lock,Socket,Cookie}` when the owning PID is
   gone or was recycled by a non-Chrome process, so a hard-killed server does not wedge the profile.
 - `muse-mailtemp.mjs` — mailtemp.vn client for OTP-based auto-login; public API (`x-api-key`,
@@ -35,6 +35,8 @@ See `README.md` for usage.
   the OTP is in the subject. `close()` after login.
 - `muse-luuvan.mjs` — luuvan.site reader (`LuuVan extends MailTemp`) over its public JSON API
   (`/api/public/inbox?address=`); code from the subject, else the body (6–8 digits: the footer has "© 2026", zip 94025).
+- `muse-tuan89.mjs` — tuan89.site reader (`Tuan89 extends MailTemp`) over its public JSON API
+  (`/api/temp-mail/inbox?email=`, the site fills `otp_code`); code from the subject, else `otp_code`.
 - `muse-addmail.mjs` — adds a fresh mailtemp box as a Meta contact email (Accounts Center → Add email → code) and
   points the account's `.env` lines at it; called by `transport.login` after a seed sign-in on a non-mailtemp address,
   CLI for pool accounts. `muse-seed.mjs` — seed CLI: sign in to `accounts/.<id>` → mailtemp step → rename into the pool.

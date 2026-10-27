@@ -4,7 +4,7 @@
  *
  *   node muse-seed.mjs <account-id> [...]
  *
- * Each id needs MUSE_ACCOUNT_<ID>_EMAIL + a way to read its code in .env (OTP_URL on generator.email / luuvan.site,
+ * Each id needs MUSE_ACCOUNT_<ID>_EMAIL + a way to read its code in .env (OTP_URL on generator.email / luuvan.site / tuan89.site,
  * or a mailtemp MAIL_TOKEN / PASSWORD / API_KEY). Per id: unattended sign-in into the hidden folder accounts/.<id>
  * (skipped by the shim's `*` scan, so it never reads half-written cookies) -> when the address is not a mailtemp box,
  * add one as a second Meta contact email and switch .env to it (muse-addmail.mjs; MUSE_ADD_MAILTEMP=0 skips) ->

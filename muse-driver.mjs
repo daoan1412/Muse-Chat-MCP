@@ -415,21 +415,25 @@ export class MuseDriver {
     const otpUrl = opts.otpUrl || process.env.MUSE_META_OTP_URL || ''
     const { isGeneratorEmailUrl } = await import('./muse-genmail.mjs')
     const { isLuuVanUrl } = await import('./muse-luuvan.mjs')
+    const { isTuan89Url } = await import('./muse-tuan89.mjs')
     const genmail = isGeneratorEmailUrl(otpUrl)
     const luuvan = isLuuVanUrl(otpUrl)
-    const auto = opts.auto !== false && !!email && !!(metaPassword || mailPassword || apiKey || mailToken || genmail || luuvan)
+    const tuan89 = isTuan89Url(otpUrl)
+    const auto = opts.auto !== false && !!email && !!(metaPassword || mailPassword || apiKey || mailToken || genmail || luuvan || tuan89)
 
     const p = await this.gotoApp()
     let auth = await this.checkAuth()
     if (auth.ok) return { loggedIn: true, viewerId: auth.viewerId || null, mode: 'already' }
 
     if (auto) {
-      // An OTP_URL on generator.email / luuvan.site picks that inbox; otherwise mailtemp.vn.
+      // An OTP_URL on generator.email / luuvan.site / tuan89.site picks that inbox; otherwise mailtemp.vn.
       const mt = genmail
         ? new (await import('./muse-genmail.mjs')).GeneratorEmail({ email, url: otpUrl, log })
         : luuvan
           ? new (await import('./muse-luuvan.mjs')).LuuVan({ email, log })
-          : new (await import('./muse-mailtemp.mjs')).MailTemp({ email, apiKey, mailPassword, mailToken, log })
+          : tuan89
+            ? new (await import('./muse-tuan89.mjs')).Tuan89({ email, log })
+            : new (await import('./muse-mailtemp.mjs')).MailTemp({ email, apiKey, mailPassword, mailToken, log })
       let ok
       try { ok = await this._autoLogin(p, mt, { ...opts, email, metaPassword, mailPassword, timeoutMs }) }
       finally { await mt.close?.() }
