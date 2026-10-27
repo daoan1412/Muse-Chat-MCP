@@ -102,8 +102,10 @@ export function clearStaleSingleton(profileDir, logger = log) {
 }
 
 export class MuseDriver {
-  constructor(profileDir = process.env.MUSE_PROFILE_DIR || path.join(__dirname, 'accounts', 'acc1')) {
+  // opts.headless overrides MUSE_HEADLESS for this instance (the noise pool re-signs accounts in on a server with no display)
+  constructor(profileDir = process.env.MUSE_PROFILE_DIR || path.join(__dirname, 'accounts', 'acc1'), opts = {}) {
     this.profileDir = profileDir
+    this.headless = opts.headless ?? HEADLESS
     this.ctx = null
     this.page = null
     this.browser = null
@@ -130,7 +132,7 @@ export class MuseDriver {
       clearStaleSingleton(this.profileDir) // leftovers from a killed run would block this launch
       return chromium.launchPersistentContext(this.profileDir, {
         ...(CHROME_PATH ? { executablePath: CHROME_PATH } : { channel: CHANNEL }),
-        headless: HEADLESS,
+        headless: this.headless,
         viewport: { width: 1366, height: 900 },
         acceptDownloads: false,
         ignoreDefaultArgs: ['--enable-automation'],
@@ -268,7 +270,7 @@ export class MuseDriver {
     const running = this.isRunning()
     const url = running ? this.page.url() : null
     if (!running) {
-      return { browserRunning: false, url: null, loggedIn: false, composerReady: false, profileDir: this.profileDir, headless: HEADLESS }
+      return { browserRunning: false, url: null, loggedIn: false, composerReady: false, profileDir: this.profileDir, headless: this.headless }
     }
     const auth = await this.checkAuth()
     const composerReady = await this.hasComposer()
@@ -279,7 +281,7 @@ export class MuseDriver {
       viewerId: auth.viewerId || null,
       composerReady,
       profileDir: this.profileDir,
-      headless: HEADLESS,
+      headless: this.headless,
     }
   }
 
@@ -335,11 +337,20 @@ export class MuseDriver {
     const metaPass = opts.metaPassword || opts.mailPassword || ''
     let seen = new Set()
     try { seen = new Set((await mt.messages()).map((m) => m.id)) } catch (e) { log('pre-inbox read failed:', e.message) }
+    let unavailable = 0
+    this.lastError = null
     for (let step = 0; step < 24; step++) {
       const auth = await this.checkAuth()
       if (auth.ok) { log('auto-login ok at step', step); return true }
       const screen = await this._detectScreen(p)
       log(`auto-login step ${step}: screen=${screen}`)
+      // Muse's own sign-in is down for this browser (26/10/2026: POST /api/auth/native/restart -> 503 for every address,
+      // fresh profile or not): retrying the email screen 24 times only burns a minute
+      if (/authentication is unavailable/i.test(await p.evaluate(() => document.body.innerText).catch(() => '')) && ++unavailable >= 3) {
+        this.lastError = 'Muse sign-in unavailable ("Authentication is unavailable", /api/auth/native/restart 503)'
+        log('auto-login:', this.lastError)
+        return false
+      }
       if (screen === 'other') log('  page:', (await p.evaluate(() => document.body.innerText).catch(() => '')).replace(/\s+/g, ' ').slice(0, 300))
       if (screen === 'email') {
         const el = await this._findInput(p, 'email')
@@ -426,7 +437,7 @@ export class MuseDriver {
       // the page may still be navigating right after the last screen (23/10/2026: "ok at step 2" then a failed check)
       for (let i = 0; ok && !auth.ok && i < 3; i++) { await sleep(3000); auth = await this.checkAuth() }
       if (ok && auth.ok) return { loggedIn: true, viewerId: auth.viewerId || null, mode: 'auto' }
-      if (HEADLESS) return { loggedIn: false, mode: 'auto-failed', hint: 'Auto-login did not complete (captcha / unexpected screen?). Re-run headed (unset MUSE_HEADLESS) to finish manually, or check credentials.' }
+      if (this.headless) return { loggedIn: false, mode: 'auto-failed', hint: this.lastError || 'Auto-login did not complete (captcha / unexpected screen?). Re-run headed (unset MUSE_HEADLESS) to finish manually, or check credentials.' }
       log('auto-login incomplete, falling back to manual sign-in')
     }
 

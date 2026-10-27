@@ -149,6 +149,13 @@ function quotaExhausted(accts) {
   return e
 }
 
+// Muse dropped the account's login: `/api/auth/check -> 401 hatchAdmissionInvalidated reason=session`, the usage action
+// "session has expired" / `401 Authentication required`, "Account requires a web checkpoint" (26/10/2026: 7 accounts at once,
+// ~2,000 failovers/hour onto them). The profile's cookies are dead; only a new sign-in brings the account back.
+const SESSION_EXPIRED_RE = /hatchAdmissionInvalidated|session has expired|Authentication required|requires a web checkpoint|not logged in \(auth\/check/i
+const sessionExpired = (e) => SESSION_EXPIRED_RE.test((e && e.message) || String(e || ''))
+const hasLoginCreds = (c) => !!(c.email && (c.metaPassword || c.mailPassword || c.apiKey || c.mailToken || /generator\.email|luuvan\.site/i.test(c.otpUrl || '')))
+
 class NoiseTransport {
   constructor() {
     this.accounts = new Map() // id -> { id, profileDir, cookies, client, viewerId, connecting, q, inflight, downUntil }
@@ -174,6 +181,13 @@ class NoiseTransport {
     // zombie-connection watchdog: an open WebSocket that stopped delivering anything while turns wait on it (23/10: turns
     // sat 12 min on a connection that had gone silent while fresh connections served the same sessions)
     this.zombieMs = Math.max(0, Number(process.env.MUSE_ZOMBIE_SEC ?? 45)) * 1000
+    // Auto re-login (MUSE_AUTO_RELOGIN=0 turns it off): an account Muse signed out leaves the auto pool and is signed in
+    // again with its .env creds into a fresh hidden profile, swapped in on success; a failed try waits
+    // MUSE_RELOGIN_BACKOFF_MIN (5), doubling up to MUSE_RELOGIN_BACKOFF_MAX_MIN (60). One sign-in at a time for the pool.
+    this.autoRelogin = process.env.MUSE_AUTO_RELOGIN !== '0'
+    this.reloginBaseMs = Math.max(1, Number(process.env.MUSE_RELOGIN_BACKOFF_MIN ?? 5)) * 60000
+    this.reloginMaxMs = Math.max(1, Number(process.env.MUSE_RELOGIN_BACKOFF_MAX_MIN ?? 60)) * 60000
+    this._reloginQ = Promise.resolve()
     if (this.zombieMs) setInterval(() => { this._checkZombies().catch(() => {}) }, 15000).unref()
     if (this.quotaEveryMs) setInterval(() => { this._checkQuotas().catch(() => {}) }, this.quotaEveryMs).unref()
     entries.filter((e) => e !== '*').forEach((e, i) => {
@@ -252,6 +266,72 @@ class NoiseTransport {
     log(`pause: ${a.id} ${on ? 'paused — no new turns' : 'resumed'} (paused: ${[...this.paused].join(', ') || '-'})`)
     return { account: a.id, paused: on, inflight: a.inflight || 0 }
   }
+  // A failure that says Muse signed the account out: take it out of the auto pool and start signing it in again.
+  _expire(a, e) {
+    if (!sessionExpired(e)) return false
+    if (!a.expired) {
+      a.expired = { since: Date.now(), reason: String((e && e.message) || e).slice(0, 200), attempts: 0, nextAt: null, lastError: null }
+      log(`session: ${a.id} signed out by Muse (${a.expired.reason}) — out of the auto pool${this.autoRelogin ? ', signing in again' : ''}`)
+    }
+    try { a.client?.close() } catch {}
+    a.client = null; a.cookies = null
+    this._scheduleRelogin(a, 0)
+    return true
+  }
+  _scheduleRelogin(a, delayMs) {
+    if (!this.autoRelogin || this.closing || !a.expired || a.reloginTimer || a.relogging) return
+    if (!hasLoginCreds(a.creds)) {
+      if (!a.expired.noCreds) log(`session: ${a.id} has no sign-in creds in .env (MUSE_ACCOUNT_${a.id.toUpperCase()}_*) — stays out until signed in by hand`)
+      a.expired.noCreds = true
+      return
+    }
+    a.expired.nextAt = Date.now() + delayMs
+    a.reloginTimer = setTimeout(() => {
+      a.reloginTimer = null
+      this._relogin(a).catch((err) => log(`session: ${a.id} re-login crashed: ${err.message}`))
+    }, delayMs)
+    a.reloginTimer.unref()
+  }
+  // Sign in into <dir>/.<name>.relogin (hidden: the `*` scan skips it), then swap it for the dead profile, which is kept as
+  // .<name>.expired until the next swap. A fresh profile, not the old one: there Meta shows the remembered account with
+  // "Authentication is unavailable" and the sign-in never gets past the email screen.
+  async _relogin(a) {
+    a.relogging = true
+    const job = this._reloginQ.then(async () => {
+      if (this.closing || !a.expired || !this.accounts.has(a.id)) return
+      const dir = path.dirname(a.profileDir), name = path.basename(a.profileDir)
+      const fresh = path.join(dir, `.${name}.relogin`), old = path.join(dir, `.${name}.expired`)
+      await fsp.rm(fresh, { recursive: true, force: true })
+      const n = ++a.expired.attempts
+      const t0 = Date.now()
+      let r
+      const d = new MuseDriver(fresh, { headless: true })
+      try { r = await d.login({ ...a.creds, timeoutMs: 180000 }) } catch (e) { r = { loggedIn: false, hint: e.message } }
+      finally { await d.close().catch(() => {}) }
+      if (!(r && r.loggedIn)) {
+        await fsp.rm(fresh, { recursive: true, force: true }).catch(() => {})
+        a.expired.lastError = String((r && (r.hint || r.mode)) || 'sign-in failed').slice(0, 200)
+        return Math.min(this.reloginMaxMs, this.reloginBaseMs * 2 ** (n - 1))
+      }
+      if (a.grabbing) await a.grabbing.catch(() => {}) // no Chromium may hold the old profile while it moves
+      await fsp.rm(old, { recursive: true, force: true })
+      // both renames back to back, no await between: a rescan must never find the account folder missing
+      fs.renameSync(a.profileDir, old)
+      fs.renameSync(fresh, a.profileDir)
+      try { a.client?.close() } catch {}
+      Object.assign(a, { expired: null, client: null, cookies: null, quota: null, quotaError: null, downUntil: 0 })
+      log(`session: ${a.id} signed in again (attempt ${n}, ${Math.round((Date.now() - t0) / 1000)} s) — back in the pool once its meter reads`)
+      this._grabCookies(a).then(() => this._checkQuota(a)).catch(() => {})
+      return 0
+    })
+    this._reloginQ = job.then(() => {}, () => {})
+    let wait = 0
+    try { wait = await job } finally { a.relogging = false }
+    if (a.expired && wait > 0) {
+      log(`session: ${a.id} sign-in attempt ${a.expired.attempts} failed (${a.expired.lastError}) — next try in ${Math.round(wait / 60000)} min`)
+      this._scheduleRelogin(a, wait)
+    }
+  }
   _acct(id) {
     id = id || this.defaultId
     if (!this.accounts.has(id)) this._rescan(true) // a just-added profile named explicitly
@@ -306,7 +386,7 @@ class NoiseTransport {
     this._rescan() // /health lists a just-seeded profile even while no turn is being routed
     const a = this._acct(opts.account)
     this._loadPaused()
-      const accounts = this.order.map((id) => { const x = this.accounts.get(id); return { id: x.id, email: x.creds.email || null, profileDir: x.profileDir, loggedIn: !!x.cookies, connected: !!(x.client && x.client.ws && x.client.ws.readyState === 1), inflight: x.inflight || 0, viewerId: x.viewerId, inPool: !this._depleted(x) && !this.paused.has(x.id), paused: this.paused.has(x.id), quota: x.quota, quotaError: x.quotaError } })
+      const accounts = this.order.map((id) => { const x = this.accounts.get(id); return { id: x.id, email: x.creds.email || null, profileDir: x.profileDir, loggedIn: !!x.cookies, connected: !!(x.client && x.client.ws && x.client.ws.readyState === 1), inflight: x.inflight || 0, viewerId: x.viewerId, inPool: !this._depleted(x) && !this.paused.has(x.id) && !x.expired, paused: this.paused.has(x.id), signedOut: x.expired ? { ...x.expired, signingIn: !!x.relogging } : null, quota: x.quota, quotaError: x.quotaError } })
     const connected = !!(a.client && a.client.ws && a.client.ws.readyState === 1)
     return {
       browserRunning: false, url: APP_URL, transport: 'noise',
@@ -352,6 +432,7 @@ class NoiseTransport {
     const c = await this._ensure(a)
     const h = await c.chatHistory(1)
     a.viewerId = (h.json && h.json.result && h.json.result.viewer_id) || null
+    if (h.status === 200 && a.expired) { log(`session: ${a.id} signed in by hand — back in the pool`); a.expired = null }
     return { account: a.id, loggedIn: h.status === 200, transport: 'noise', viewerId: a.viewerId }
   }
   async newChat(opts = {}) { const a = this._acct(opts.account); return { ok: true, transport: 'noise', account: a.id, note: 'over noise a new side chat is created per request via new_thread/newSession (the thread materializes on first send)' } }
@@ -498,7 +579,8 @@ class NoiseTransport {
     a.inflight = (a.inflight || 0) + 1
     const settle = (r) => { a.inflight = Math.max(0, (a.inflight || 0) - 1); return r }
     // tag the error with the account that ran the turn, so the shim can report it like it does for a success
-    const fail = (e) => { a.inflight = Math.max(0, (a.inflight || 0) - 1); if (e && typeof e === 'object' && !e.account) e.account = a.id; throw e }
+    // (and a turn that found the account signed out takes it out of the pool, pinned turns included)
+    const fail = (e) => { a.inflight = Math.max(0, (a.inflight || 0) - 1); if (e && typeof e === 'object' && !e.account) e.account = a.id; this._expire(a, e); throw e }
     const p = (opts.newSession || opts.newThread) ? this._run(a, prompt, opts) : this._serial(a, () => this._run(a, prompt, opts))
     return p.then(settle, fail)
   }
@@ -508,11 +590,11 @@ class NoiseTransport {
     this._rescan()
     const ranked = this._lbOrder()
     this._loadPaused()
-    const live = ranked.filter((a) => !this._depleted(a) && !this.paused.has(a.id))
+    const live = ranked.filter((a) => !this._depleted(a) && !this.paused.has(a.id) && !a.expired)
     if (!live.length) {
-      const unpaused = ranked.filter((a) => !this.paused.has(a.id))
-      if (unpaused.length) throw quotaExhausted(unpaused)
-      const e = new Error(`every Muse account is paused (${ranked.map((a) => a.id).join(', ')})`)
+      const usable = ranked.filter((a) => !this.paused.has(a.id) && !a.expired)
+      if (usable.length) throw quotaExhausted(usable)
+      const e = new Error(`every Muse account is paused or signed out (${ranked.map((a) => a.id).join(', ')})`)
       e.quotaExhausted = true // same 503 as out of quota: callers move the work elsewhere
       throw e
     }
@@ -551,6 +633,7 @@ class NoiseTransport {
       } catch (e) {
         if (a.quotaError !== e.message) log(`quota: ${a.id} read failed: ${e.message}`)
         a.quotaError = e.message
+        this._expire(a, e)
       } finally {
         a.quotaChecking = null
       }
@@ -604,7 +687,7 @@ class NoiseTransport {
       }
       // `cands` was ranked when the request came in: an account found out of quota (or paused) since then is skipped, or
       // a failover lands on it — right after a restart every meter is unread, so a 429 wave sent ~60 turns onto DEPLETED ones
-      if (this._depleted(a) || this.paused.has(a.id)) continue
+      if (this._depleted(a) || this.paused.has(a.id) || a.expired) continue
       // meter still unreadable: let another account take the turn if there is one
       if (this.quotaEveryMs && !a.quota && a !== cands[cands.length - 1]) continue
       tried++
@@ -697,7 +780,8 @@ class NoiseTransport {
     const a = this._acct(opts.account)
     let c = a.client
     if (!c) c = new MuseNoiseClient({ cookies: a.cookies || await this._grabCookies(a), log })
-    const sub = await c.usage()
+    let sub
+    try { sub = await c.usage() } catch (e) { this._expire(a, e); throw e }
     this._noteQuota(a, sub) // a caller's read (console, muse_usage) refreshes the quota guard too
     return { ...sub, account: a.id, transport: 'noise' }
   }
@@ -729,6 +813,7 @@ class NoiseTransport {
   // wait up to waitMs for them to finish, then cancel whatever is still running on any connection before close().
   async shutdown({ waitMs = 45000 } = {}) {
     this.closing = true
+    for (const a of this.accounts.values()) if (a.reloginTimer) { clearTimeout(a.reloginTimer); a.reloginTimer = null }
     const busy = () => [...this.accounts.values()].reduce((n, a) => n + (a.inflight || 0), 0)
     const t0 = Date.now()
     while (busy() && Date.now() - t0 < waitMs) await sleep(250)

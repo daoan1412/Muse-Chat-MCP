@@ -63,7 +63,13 @@ See `README.md` for usage.
   (`round_robin` default when >1 | `least_conn` | `first`/`none`); an explicit `x-muse-account`/`account`
   always pins its account, and a failed candidate fails over to the next (`_turnWithFailover`). An account out of
   quota (`_depleted`: usage meter read every `MUSE_QUOTA_CHECK_SEC` by `_checkQuotas`, on first connect, and on
-  every `usage()` call) is not an LB candidate; all out → `quotaExhausted` → shim `503 insufficient_quota`. Reads
+  every `usage()` call) is not an LB candidate; all out → `quotaExhausted` → shim `503 insufficient_quota`.
+  An account Muse signed out (`sessionExpired`: `hatchAdmissionInvalidated`, "session has expired", `401 Authentication
+  required`, "web checkpoint" — from a turn, a meter read or `usage()`) leaves the pool too (`_expire`) and is signed in
+  again (`_relogin`, `MUSE_AUTO_RELOGIN=0` off): headless `MuseDriver.login` with its `.env` creds into a FRESH hidden
+  profile `.<id>.relogin` (the old profile stalls on "Authentication is unavailable"), swapped in by two back-to-back
+  `renameSync` (old kept as `.<id>.expired`); one sign-in at a time, failures back off `MUSE_RELOGIN_BACKOFF_MIN` (5)
+  doubling to `MUSE_RELOGIN_BACKOFF_MAX_MIN` (60). `/health` shows it as `signedOut`. Reads
   (`list_chats`/`usage`/…) stay pinned to the default for determinism — LB applies to `chat`/`chatStream`.
 - Streaming emits only **monotonic, stability-quieted** text; exactly one `finish_reason`.
 - Tool calling is **decision-only** (Muse must not actually execute the tool).
