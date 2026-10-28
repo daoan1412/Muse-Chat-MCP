@@ -40,7 +40,7 @@ async function grabCookies(profileDir = PROFILE_DIR) {
   clearStaleSingleton(profileDir) // a killed server leaves Chrome's singleton files behind
   const ctx = await chromium.launchPersistentContext(profileDir, {
     ...(CHROME_PATH ? { executablePath: CHROME_PATH } : { channel: CHANNEL }), headless: true, viewport: { width: 1366, height: 900 },
-    args: ['--no-sandbox', '--disable-gpu', '--disable-blink-features=AutomationControlled'],
+    args: ['--no-sandbox', '--disable-gpu', '--disable-blink-features=AutomationControlled', '--disk-cache-size=67108864'],
   })
   try {
     const p = ctx.pages()[0] || await ctx.newPage()
@@ -341,10 +341,12 @@ class NoiseTransport {
   }
   // One cookie read per account at a time, shared by every caller: two Chromium on one profile collide (ProcessSingleton),
   // and a console usage read racing a reconnect failed the whole batch of turns waiting on that connect (693 failovers/24 h).
+  // Every read is one Chromium launch: logged so launches can be counted.
   _grabCookies(a) {
     if (!a.grabbing) {
+      const t0 = Date.now()
       a.grabbing = grabCookies(a.profileDir)
-        .then((c) => (a.cookies = c))
+        .then((c) => { log(`cookies: ${a.id} read from its profile (Chromium, ${Date.now() - t0} ms)`); return (a.cookies = c) })
         .finally(() => { a.grabbing = null })
     }
     return a.grabbing
@@ -678,7 +680,7 @@ class NoiseTransport {
         // the meter is plain HTTPS with the login cookies: read it without waiting on the VM connection, which may be
         // failing (WS 502 right after a restart let turns through to DEPLETED accounts while their meter went unread)
         try {
-          if (!a.cookies && !a.client) await this._grabCookies(a)
+          if (!a.cookies && !a.client && !a.expired) await this._grabCookies(a)
           // a read can fail on a burst (28 reads at start: `fetch failed`, 14 turns then ran on a DEPLETED account): retry
           for (let k = 0; k < 3 && !a.quota; k++) { if (k) await sleep(1000 * k); await this._checkQuota(a) }
         } catch (e) { a.quotaError = e.message }
@@ -696,10 +698,9 @@ class NoiseTransport {
         if (e.aborted || e.badInput) throw e // the caller is gone / sent an unreadable file: no failover, the account did nothing wrong
         last = e
         log('LB failover from', a.id, ':', e && e.message)
-        if (cands.length > 1) {
-          a.downUntil = Date.now() + Math.max(0, Number(process.env.MUSE_ACCOUNT_COOLDOWN_SEC ?? 60)) * 1000
-          a.cookies = null // re-read the profile after the cooldown (it may have been signed in meanwhile)
-        }
+        // cooldown only, the cookies stay: a WS/serve failure is not a login problem (a dropped login goes through _expire,
+        // which clears them), and re-reading them cost a Chromium launch on the reconnect after every failover
+        if (cands.length > 1) a.downUntil = Date.now() + Math.max(0, Number(process.env.MUSE_ACCOUNT_COOLDOWN_SEC ?? 60)) * 1000
       }
     }
     if (!tried) throw quotaExhausted(cands)
@@ -779,6 +780,11 @@ class NoiseTransport {
   async usage(opts = {}) {
     const a = this._acct(opts.account)
     let c = a.client
+    // a profile Muse signed out has no cookies worth a Chromium launch: the console reads every account's meter every
+    // 10 min, and each read relaunched Chromium on every signed-out profile (sign-in again goes through _relogin/login)
+    if (!c && !a.cookies && a.expired) {
+      throw new Error(`${a.id} is signed out by Muse (${a.expired.reason}) — ${a.relogging ? 'signing in again' : 'waiting to sign in again'}`)
+    }
     if (!c) c = new MuseNoiseClient({ cookies: a.cookies || await this._grabCookies(a), log })
     let sub
     try { sub = await c.usage() } catch (e) { this._expire(a, e); throw e }

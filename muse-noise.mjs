@@ -29,7 +29,7 @@ const APP_ID = 'hatch-web'
 // redeploy changes it (24/10/2026 01:07 UTC 4029ac5c… → 40034617…, every meter read then got 404 "Server action not
 // found" and the pool kept stale quotas) → usage() finds the new id in the app's JS (refreshSubscriptionAction).
 // MUSE_SUBSCRIPTION_ACTION_ID sets the id to start from.
-let subscriptionActionId = process.env.MUSE_SUBSCRIPTION_ACTION_ID || '40034617c46db812e70eec8e362677944a0a532adf'
+let subscriptionActionId = process.env.MUSE_SUBSCRIPTION_ACTION_ID || '409b972cbb33d3e372f4ca9d3c8332677217064f62' // 27/10
 export const subscriptionAction = () => subscriptionActionId
 const PROTONAME = 'Noise_XX_25519_AESGCM_SHA256'
 const CHUNK_MAX = 65489
@@ -481,7 +481,8 @@ export class MuseNoiseClient {
   // Usage/credits meter via the Next.js RSC server action fetchSubscriptionAction.
   // Plain HTTPS POST to the app origin (no noise WS needed) — only the login cookies.
   // Cloudflare bot-checks the request, so send full browser client-hint headers.
-  // 404 "Server action not found" = Muse redeployed: look up the new action id once, then read again.
+  // 404 "Server action not found" / 409 "Server Action unavailable" (since 27/10, for an id from before the redeploy)
+  // = Muse redeployed: look up the new action id once, then read again.
   async usage({ includeAgreement = true } = {}, retried = false) {
     const id = subscriptionActionId
     const res = await fetch(this.origin + '/', {
@@ -502,7 +503,7 @@ export class MuseNoiseClient {
     })
     const txt = await res.text()
     // another account's read may have found the new id while this one was on the wire
-    if (res.status === 404 && /server action not found/i.test(txt) && !retried
+    if ((res.status === 404 || res.status === 409) && /server action (not found|unavailable)/i.test(txt) && !retried
       && (id !== subscriptionActionId || await refreshSubscriptionAction(this))) return this.usage({ includeAgreement }, true)
     if (!res.ok) throw new Error(`usage action -> ${res.status}: ${txt.slice(0, 200)}`)
     const r = parseFlightResult(txt)

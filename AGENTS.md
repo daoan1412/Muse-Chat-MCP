@@ -71,7 +71,9 @@ See `README.md` for usage.
   again (`_relogin`, `MUSE_AUTO_RELOGIN=0` off): headless `MuseDriver.login` with its `.env` creds into a FRESH hidden
   profile `.<id>.relogin` (the old profile stalls on "Authentication is unavailable"), swapped in by two back-to-back
   `renameSync` (old kept as `.<id>.expired`); one sign-in at a time, failures back off `MUSE_RELOGIN_BACKOFF_MIN` (5)
-  doubling to `MUSE_RELOGIN_BACKOFF_MAX_MIN` (60). `/health` shows it as `signedOut`. Reads
+  doubling to `MUSE_RELOGIN_BACKOFF_MAX_MIN` (60). `/health` shows it as `signedOut`. Every cookie read is a Chromium
+  launch (logged `cookies: <id> read from its profile`), so only `_expire` drops an account's cookies: an LB failover
+  just sets the cooldown, and `usage()` on a signed-out account fails at once instead of opening its profile. Reads
   (`list_chats`/`usage`/…) stay pinned to the default for determinism — LB applies to `chat`/`chatStream`.
 - Streaming emits only **monotonic, stability-quieted** text; exactly one `finish_reason`.
 - Tool calling is **decision-only** (Muse must not actually execute the tool).

@@ -141,6 +141,7 @@ export class MuseDriver {
           '--no-default-browser-check',
           '--disable-blink-features=AutomationControlled',
           '--disable-features=Translate,OptimizationGuideModelDownloading',
+          '--disk-cache-size=67108864', // 36 profiles grew ~400 MB/day each without a cap
         ],
       })
     }
