@@ -122,6 +122,17 @@ See `README.md` for usage.
 - Attachments: `POST /fs/write` `{path:"workspace/user/files/<name>", data_base64,
   overwrite, create_parent}` (chunk 512 KiB, append for later parts), then reference the
   file in the message text as `![alt](sandbox://workspace/user/files/<name>)`.
+- The model sees an attachment only by opening that sandbox file with its own tool, and every file is linked
+  at the END of the message. `buildPrompt` therefore leaves `[attachment-<n>]` where each attached part was
+  (n = collectFiles order = `readRef`'s `attachment-<n>` name for a data: URL, else the link's alt label) and
+  ends with `attachmentNote` (open the files). `fileRef` is the ONE rule for both collectFiles and the markers;
+  a message's text is built only where the prompt shows it. Without markers (28/10/2026) Muse mapped images to
+  the wrong question when a batch lacked per-question image counts, and skipped images on feed posts.
+- Muse's viewer draws transparency BLACK. `_run` passes every file it read through `flattenTransparent`
+  (muse-image.mjs) before `_uploadAll`: a PNG, GIF or still WebP with transparent pixels becomes an opaque PNG
+  (`<name>.png`, same attachment number), anything else is sent as it is, and a file that does not decode never
+  blocks the turn. Flattening runs on the event loop of every turn: keep the guards listed in the module header
+  (pixel / row caps, interlace inflate cap, single IHDR, GIF screen growth and LZW loop check) when touching it.
 - Generated media lives in `delta.presentation` events (live AND in `chat.history`):
   `payload.data.{images,videos,files}[]` each `{path:"sandbox://workspace/…", mime, label}`;
   download with `GET /fs/raw/workspace/<path>` (binary).

@@ -63,24 +63,99 @@ function textOf(content) {
   return String(content)
 }
 
-function buildPrompt(body) {
-  const messages = Array.isArray(body.messages) ? body.messages : []
-  const system = messages.filter((m) => m.role === 'system').map((m) => textOf(m.content)).filter(Boolean).join('\n\n')
+// Where each attached file sits in the prompt (28/10/2026). Over noise an attachment is a FILE uploaded to Muse's sandbox
+// and linked at the END of the message (`![](sandbox://…/attachment-<n>_….png)`): the model sees an image only once it
+// opens that file with its own tools. textOf() dropped the image parts, so a caller that interleaves images with text (moon
+// KG: question 1 text, its image, question 2 text…) lost which image belongs where, and nothing asked Muse to open the
+// files — it answered without them ("no image attached", made-up readings). An attached part now leaves the marker
+// [attachment-<n>] in the text (n = its place in collectFiles order, which also names the uploaded file) and a closing
+// note asks Muse to open every file. Header `x-muse-image-markers: off` (body `muse_image_markers: false`, or
+// MUSE_SHIM_IMAGE_MARKERS=0 for every request) sends the prompt as before. On by default over noise only: the browser
+// transport attaches files through the composer, not as links at the end of the message, so the note would be wrong there.
+const isOff = (v) => ['0', 'off', 'false', 'no'].includes(String(v).split(',')[0].trim().toLowerCase())
+const IMAGE_MARKERS = process.env.MUSE_SHIM_IMAGE_MARKERS
+  ? !isOff(process.env.MUSE_SHIM_IMAGE_MARKERS)
+  : (process.env.MUSE_TRANSPORT || 'browser').toLowerCase() === 'noise'
 
-  // Send the latest user (or tool-result) message as a plain message. Roleplay-style
-  // role markers ("### USER"/"### ASSISTANT") make Muse push back with "that's a fake
-  // transcript", and Muse already keeps its own conversation thread.
-  let userText = ''
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i]
-    if (m.role === 'user' || m.role === 'tool') { userText = textOf(m.content); break }
+function imageMarkersFor(req, body) {
+  const h = req.headers['x-muse-image-markers'] // a repeated header arrives joined: "off, off"
+  const v = String(h || (body.muse_image_markers ?? '')).trim()
+  return v ? !isOff(v) : IMAGE_MARKERS
+}
+
+// Text of a message with each attached part replaced by [attachment-<n>]; `first` = files before this message in
+// collectFiles order.
+function textWithMarkers(content, first) {
+  if (!Array.isArray(content)) return textOf(content)
+  let n = first
+  return content
+    .map((p) => (typeof p === 'string' ? p : fileRef(p) ? `[attachment-${++n}]` : p && (p.text ?? p.content ?? '')))
+    .filter(Boolean)
+    .join('\n')
+}
+
+// `marked`: some [attachment-k] shows in the prompt (not so for files of body.files only, or images of earlier turns when
+// the prompt shows the last message only). `tools`: the caller's tool list is in the prompt — "your file viewing tool"
+// must not read as one of THOSE (a read(path: "attachment-1") call the client cannot run), and an agent loop resends every
+// image each turn, so only the files the request needs are to be opened.
+function attachmentNote(n, { marked = true, tools = false } = {}) {
+  const open = tools
+    ? 'Open the attached files the request needs with your own built-in file / image viewer (not one of the tools listed ' +
+      'above) and look at them before answering; never guess what an image shows.'
+    : n === 1
+      ? 'Open it with your file / image viewing tool and look at it before answering; never guess what it shows.'
+      : 'Open EVERY attached file with your file / image viewing tool and look at it before answering; never guess what an ' +
+        'image shows.'
+  if (n === 1) {
+    return 'One file is attached to this message: it is linked at the end of the message (attachment-1)' +
+      (marked ? ', and [attachment-1] in the text marks where it belongs. ' : '. ') + open
   }
+  return `${n} files are attached to this message: they are linked at the end of the message in order, attachment-1 … ` +
+    `attachment-${n}` + (marked ? ', and a marker [attachment-k] in the text marks where file k belongs. ' : '. ') + open
+}
 
+export function buildPrompt(body, { markers = IMAGE_MARKERS } = {}) {
+  const messages = Array.isArray(body.messages) ? body.messages : []
+  // files of body.files come first in collectFiles, then the parts of every message in order; first[i] = files before
+  // message i. A message's text is built only where the prompt shows it, as before (a part never shown cannot fail it).
+  let fileNo = Array.isArray(body.files) ? body.files.filter(Boolean).length : 0
+  const first = messages.map((m) => {
+    const before = fileNo
+    if (m && Array.isArray(m.content)) for (const p of m.content) if (fileRef(p)) fileNo++
+    return before
+  })
+  const textAt = (i) => (markers ? textWithMarkers(messages[i].content, first[i]) : textOf(messages[i].content))
+  const system = messages.map((m, i) => (m.role === 'system' ? textAt(i) : '')).filter(Boolean).join('\n\n')
+
+  // Send the latest user message as a plain message. Roleplay-style role markers
+  // ("### USER"/"### ASSISTANT") make Muse push back with "that's a fake transcript".
+  let lastUser = -1
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'user') { lastUser = i; break }
+  }
+  const userText = lastUser >= 0 ? textAt(lastUser) : ''
+  // Tool rounds after that message (assistant tool_calls + role:"tool" results). Each turn may land on a
+  // fresh thread or another pool account, so Muse cannot be relied on to remember the request or the
+  // calls: the prompt restates the request and every call with its result.
+  const steps = toolSteps(messages.slice(lastUser + 1), (j) => textAt(lastUser + 1 + j))
+
+  const forced = forcedTool(body)
+  const tools = Array.isArray(body.tools) ? body.tools : []
+  // A tool-using caller (an agent) sends the whole conversation each turn; for the same reason, earlier turns go
+  // along as context (the user's name, city, … live there). Without tools the prompt stays the last message only.
+  const history = tools.length && body.tool_choice !== 'none'
+    ? historyLines(messages.slice(0, Math.max(0, lastUser)), textAt)
+    : []
   const parts = []
   if (system) parts.push(system)
 
-  const tools = Array.isArray(body.tools) ? body.tools : []
-  if (tools.length && body.tool_choice !== 'none') {
+  if (forced) {
+    parts.push([
+      'Decide the tool call(s) for the user\'s request below. You are only DECIDING the call — do NOT perform the action,',
+      'do NOT browse, do NOT invent results.',
+      schemaDirective({ mode: 'json_schema', schema: forcedToolSchema(body, forced) }),
+    ].join('\n'))
+  } else if (tools.length && body.tool_choice !== 'none') {
     const schemas = tools.map((t) => t.function || t).map((f) => ({
       name: f.name,
       description: f.description,
@@ -90,6 +165,7 @@ function buildPrompt(body) {
       [
         'If the request needs a tool, reply with ONLY this JSON and nothing else:',
         '{"tool_calls":[{"name":"<tool name>","arguments":{ ... }}]}',
+        'Several independent calls can go in the one array.',
         'You are only DECIDING whether a tool call should be made — do NOT perform the action,',
         'do NOT browse, do NOT invent results. Otherwise reply normally. Tool schemas:',
         JSON.stringify(schemas),
@@ -100,20 +176,142 @@ function buildPrompt(body) {
   const rfInfo = normalizeResponseFormat(body.response_format)
   if (rfInfo) parts.push(schemaDirective(rfInfo))
 
-  if (userText) parts.push(userText)
+  if (history.length) {
+    parts.push(['Earlier in this conversation (context only, already handled):', ...history].join('\n'))
+  }
+  if (steps.length) {
+    parts.push(`The user's request:\n${userText}`)
+    parts.push([
+      'Tool calls already made for this request and the results the tools returned (real results, use them as they are):',
+      ...steps.map((s, i) => `${i + 1}. ${s}`),
+    ].join('\n'))
+    parts.push(forced
+      ? 'Decide the next tool call from these results; do not repeat a call that already has a result.'
+      : 'Now answer the user\'s request from these results, in the language the user wrote in. ' +
+        'If you still need another tool, reply with the tool_calls JSON instead; do not repeat a call that already has a result.')
+  } else if (userText) parts.push(history.length ? `The user's latest message:\n${userText}` : userText)
+  if (markers && fileNo) {
+    const marked = parts.some((t) => /\[attachment-\d+\]/.test(t))
+    parts.push(attachmentNote(fileNo, { marked, tools: tools.length > 0 && body.tool_choice !== 'none' }))
+  }
   return parts.join('\n\n').trim()
+}
+
+const HISTORY_MAX_CHARS = Number(process.env.MUSE_SHIM_HISTORY_CHARS || 24000)
+const clip = (s, n) => (s.length > n ? `${s.slice(0, n)} …` : s)
+
+// Earlier turns as plain lines ("User: …", "You: …", calls and results), newest kept when over HISTORY_MAX_CHARS.
+// `textAt(j)` = msgs[j] as buildPrompt renders it: an image of an earlier turn keeps its [attachment-<n>] marker here.
+function historyLines(msgs, textAt = (j) => textOf(msgs[j].content)) {
+  const lines = []
+  for (const [j, m] of msgs.entries()) {
+    if (m.role === 'user') lines.push(`User: ${clip(textAt(j), 2000)}`)
+    else if (m.role === 'assistant') {
+      const text = textAt(j).trim()
+      if (text) lines.push(`You: ${clip(text, 2000)}`)
+      for (const c of Array.isArray(m.tool_calls) ? m.tool_calls : []) {
+        const f = c.function || c
+        lines.push(`You called ${f.name}(${typeof f.arguments === 'string' ? f.arguments : JSON.stringify(f.arguments ?? {})})`)
+      }
+    } else if (m.role === 'tool') lines.push(`  -> ${clip(textAt(j), 2000)}`)
+  }
+  let total = 0
+  let i = lines.length
+  while (i > 0 && total + lines[i - 1].length <= HISTORY_MAX_CHARS) total += lines[--i].length + 1
+  return lines.slice(i)
+}
+
+// tool_choice "required" -> '*', {type:'function',function:{name}} -> that name, else null.
+function forcedTool(body) {
+  if (!Array.isArray(body.tools) || !body.tools.length) return null
+  const tc = body.tool_choice
+  if (tc === 'required') return '*'
+  if (tc && typeof tc === 'object') return (tc.function && tc.function.name) || tc.name || '*'
+  return null
+}
+
+// JSON Schema of {"tool_calls":[{name, arguments}]} limited to the tools tool_choice allows (an unknown name -> all).
+function forcedToolSchema(body, forced) {
+  const all = body.tools.map((t) => t.function || t)
+  const fns = forced === '*' ? all : all.filter((f) => f.name === forced)
+  const item = (f) => ({
+    type: 'object',
+    ...(f.description ? { description: f.description } : {}),
+    required: ['name', 'arguments'],
+    properties: { name: { const: f.name }, arguments: f.parameters || { type: 'object' } },
+  })
+  const list = fns.length ? fns : all
+  return {
+    type: 'object',
+    required: ['tool_calls'],
+    properties: { tool_calls: { type: 'array', minItems: 1, items: list.length === 1 ? item(list[0]) : { anyOf: list.map(item) } } },
+  }
+}
+
+// One Muse turn for a request with tools -> { r, calls }. When tool_choice forces a call, plain instructions are not
+// enough (Muse just answers a request that needs no tool), so the reply goes through the structured-output path:
+// Ajv against forcedToolSchema, corrective retries.
+async function chatForTools(prompt, body, opts) {
+  const forced = forcedTool(body)
+  if (forced) {
+    const schema = forcedToolSchema(body, forced)
+    const out = await runStructured(prompt, { mode: 'json_schema', schema, name: 'tool_calls' }, compileValidator(schema), opts)
+    const reply = JSON.stringify(out.obj)
+    return { r: { reply, account: out.account }, calls: parseToolCalls(reply) }
+  }
+  const r = await transport.chat(prompt, opts)
+  return { r, calls: r.error && !r.reply ? null : parseToolCalls(r.reply) }
+}
+
+// Lines for the tool rounds after the user's message: each call with its result (matched by tool_call_id,
+// else by order), plus any text the assistant wrote alongside its calls. `textAt` as in historyLines (a tool result
+// that carries an image keeps its [attachment-<n>] marker).
+function toolSteps(msgs, textAt = (j) => textOf(msgs[j].content)) {
+  const calls = []
+  const byId = new Map()
+  const notes = []
+  for (const [j, m] of msgs.entries()) {
+    if (m.role === 'assistant') {
+      const text = textAt(j).trim()
+      if (text) notes.push({ at: calls.length, text })
+      for (const c of Array.isArray(m.tool_calls) ? m.tool_calls : []) {
+        const f = c.function || c
+        let args = f.arguments ?? {}
+        if (typeof args !== 'string') args = JSON.stringify(args)
+        const call = { name: f.name || '?', args, result: null }
+        calls.push(call)
+        if (c.id) byId.set(c.id, call)
+      }
+    } else if (m.role === 'tool') {
+      const call = byId.get(m.tool_call_id) || calls.find((c) => c.result == null && (!m.name || c.name === m.name))
+      const result = textAt(j)
+      if (call) call.result = result
+      else calls.push({ name: m.name || 'tool', args: null, result })
+    }
+  }
+  const lines = []
+  calls.forEach((c, i) => {
+    for (const n of notes) if (n.at === i) lines.push(`(you wrote) ${n.text}`)
+    lines.push(`${c.name}(${c.args ?? ''}) -> ${c.result == null ? '(no result yet)' : c.result}`)
+  })
+  for (const n of notes) if (n.at >= calls.length) lines.push(`(you wrote) ${n.text}`)
+  return calls.length ? lines : []
 }
 
 function parseToolCalls(text) {
   if (!text) return null
   const trimmed = text.trim()
-  // Accept a bare JSON object or one inside a ```json fence.
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)
-  const candidate = (fenced ? fenced[1] : trimmed).trim()
-  if (!candidate.startsWith('{') || !candidate.endsWith('}')) return null
+  // Accept a bare JSON object or one inside a ```json fence. The bare object goes first: a call that writes a
+  // Markdown file carries ``` fences inside its "content" string, and a fence match would cut the JSON there.
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)```$/i) || trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)
+  const at = trimmed.indexOf('{"tool_calls"')
+  const candidates = [trimmed, fenced && fenced[1].trim(), at >= 0 && balancedJson(trimmed, at)].filter(Boolean)
   let obj
-  try { obj = JSON.parse(candidate) } catch { return null }
-  const calls = obj && (obj.tool_calls || obj.toolCalls)
+  for (const c of candidates) {
+    if (!c.startsWith('{') || !c.endsWith('}')) continue
+    try { obj = JSON.parse(c); break } catch {}
+  }
+  const calls = (obj && (obj.tool_calls || obj.toolCalls)) || (at >= 0 ? salvageCalls(trimmed, at) : null)
   if (!Array.isArray(calls) || !calls.length) return null
   return calls
     .map((c, i) => {
@@ -182,6 +380,7 @@ function schemaDirective(rfInfo) {
 function extractJson(text) {
   if (!text) return { ok: false }
   let t = String(text).trim()
+  try { return { ok: true, value: JSON.parse(t) } } catch {} // before fences: a string value may hold ``` itself
   const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i)
   if (fence) t = fence[1].trim()
   try { return { ok: true, value: JSON.parse(t) } } catch {}
@@ -198,6 +397,43 @@ function extractJson(text) {
   }
   if (end < 0) return { ok: false }
   try { return { ok: true, value: JSON.parse(t.slice(start, end + 1)) } } catch { return { ok: false } }
+}
+
+// Calls out of a tool_calls reply that is not valid JSON as a whole: Muse sometimes drops the brace that closes
+// one call before the next ('..."content":"..."}, {"name":…' when it writes two long files in one reply). Each
+// {"name": "…", "arguments": {…}} outside a string is read on its own; the arguments object must parse.
+function salvageCalls(t, start) {
+  const out = []
+  const head = /\{\s*"name"\s*:\s*"([^"\\]+)"\s*,\s*"arguments"\s*:\s*\{/y
+  let inStr = false, esc = false
+  for (let i = start; i < t.length; i++) {
+    const c = t[i]
+    if (inStr) { if (esc) esc = false; else if (c === '\\') esc = true; else if (c === '"') inStr = false; continue }
+    if (c === '"') { inStr = true; continue }
+    if (c !== '{') continue
+    head.lastIndex = i
+    const m = head.exec(t)
+    if (!m) continue
+    const argsAt = head.lastIndex - 1
+    const raw = balancedJson(t, argsAt)
+    if (!raw) break
+    try { out.push({ name: m[1], arguments: JSON.parse(raw) }) } catch { return null }
+    i = argsAt + raw.length - 1
+  }
+  return out.length ? out : null
+}
+
+// The balanced {...} starting at `start` (strings and escapes respected), or null when it never closes.
+function balancedJson(t, start) {
+  let depth = 0, inStr = false, esc = false
+  for (let i = start; i < t.length; i++) {
+    const c = t[i]
+    if (inStr) { if (esc) esc = false; else if (c === '\\') esc = true; else if (c === '"') inStr = false; continue }
+    if (c === '"') { inStr = true; continue }
+    if (c === '{') depth++
+    else if (c === '}') { depth--; if (depth === 0) return t.slice(start, i + 1) }
+  }
+  return null
 }
 
 function corrective(errors, rfInfo) {
@@ -248,29 +484,37 @@ async function runStructured(basePrompt, rfInfo, validate, opts) {
 //   - body.files: ["C:\\img.png", "https://.../v.mp4", { url } | { path } | { buffer, name, mimeType }]
 //   - message.content parts: { type: "image_url", image_url: { url } } | { type: "input_image", image_url }
 //   - message.content parts: { type: "file", file: { file_url | file_data, filename, mime_type } }
-function collectFiles(body) {
+export function collectFiles(body) {
   const out = []
   if (Array.isArray(body.files)) for (const f of body.files) if (f) out.push(f)
   const messages = Array.isArray(body.messages) ? body.messages : []
   for (const m of messages) {
     if (!Array.isArray(m.content)) continue
     for (const part of m.content) {
-      if (!part || typeof part === 'string') continue
-      const t = part.type
-      if ((t === 'image_url' || t === 'input_image') && part.image_url) {
-        out.push({ url: typeof part.image_url === 'string' ? part.image_url : part.image_url.url })
-      } else if (t === 'file' && part.file) {
-        const f = part.file
-        if (f.file_url) out.push({ url: f.file_url })
-        else if (f.file_data) {
-          const d = String(f.file_data)
-          if (/^data:/i.test(d)) out.push({ url: d })
-          else out.push({ buffer: d, name: f.filename || 'file', mimeType: f.mime_type || 'application/octet-stream' })
-        }
-      }
+      const ref = fileRef(part)
+      if (ref) out.push(ref)
     }
   }
   return out
+}
+
+// The file ref of a message part that carries an attachment, else null (buildPrompt numbers the same parts).
+function fileRef(part) {
+  if (!part || typeof part !== 'object') return null
+  const t = part.type
+  if ((t === 'image_url' || t === 'input_image') && part.image_url) {
+    return { url: typeof part.image_url === 'string' ? part.image_url : part.image_url.url }
+  }
+  if (t === 'file' && part.file) {
+    const f = part.file
+    if (f.file_url) return { url: f.file_url }
+    if (f.file_data) {
+      const d = String(f.file_data)
+      if (/^data:/i.test(d)) return { url: d }
+      return { buffer: d, name: f.filename || 'file', mimeType: f.mime_type || 'application/octet-stream' }
+    }
+  }
+  return null
 }
 
 // ---------------------------------------------------------------- responses
@@ -344,7 +588,11 @@ async function handleChat(req, res, body) {
   // Send header `x-muse-thread: new` to start a fresh thread instead.
   const newThread = req.headers['x-muse-thread'] === 'new'
   const account = req.headers['x-muse-account'] || body.account || undefined
-  const prompt = buildPrompt(body)
+  const markers = imageMarkersFor(req, body)
+  // transparent images flattened before upload (muse-transport.mjs, muse-image.mjs); `x-muse-flatten: off` keeps the original
+  const fv = String(req.headers['x-muse-flatten'] || (body.muse_flatten ?? '')).trim()
+  const flatten = fv ? !isOff(fv) : undefined
+  const prompt = buildPrompt(body, { markers })
   const wantTools = Array.isArray(body.tools) && body.tools.length > 0 && body.tool_choice !== 'none'
   const stream = body.stream === true
   const rfInfo = normalizeResponseFormat(body.response_format)
@@ -366,7 +614,7 @@ async function handleChat(req, res, body) {
   signal.addEventListener('abort', () => openChats.delete(ac), { once: true })
   res.on('close', () => openChats.delete(ac))
 
-  log(`chat model=${model} stream=${stream} tools=${wantTools} files=${files.length} target=${chat !== undefined ? chat : 'current'} account=${account || 'auto'} promptChars=${prompt.length}`)
+  log(`chat model=${model} stream=${stream} tools=${wantTools} files=${files.length}${files.length && !markers ? ' (no markers)' : ''} target=${chat !== undefined ? chat : 'current'} account=${account || 'auto'} promptChars=${prompt.length}`)
 
   try {
     if (rfInfo) {
@@ -375,7 +623,7 @@ async function handleChat(req, res, body) {
         try { validate = compileValidator(rfInfo.schema) }
         catch (e) { return sendError(res, 400, `Invalid JSON Schema: ${e.message}`, 'invalid_request_error', null, 'response_format') }
       }
-      const out = await runStructured(prompt, rfInfo, validate, { timeoutMs, newThread, files, chat, account, signal })
+      const out = await runStructured(prompt, rfInfo, validate, { timeoutMs, newThread, files, chat, account, signal, flatten })
       const jsonStr = JSON.stringify(out.obj)
       if (stream) {
         const w = beginStream(res); streamWriter = w; const write = w.write
@@ -407,9 +655,9 @@ async function handleChat(req, res, body) {
       let r
       if (wantTools) {
         // Buffer so we can decide tool_calls vs content before emitting.
-        r = await transport.chat(prompt, { timeoutMs, newThread, files, chat, account, signal })
+        let calls
+        ({ r, calls } = await chatForTools(prompt, body, { timeoutMs, newThread, files, chat, account, signal, flatten }))
         if (r.error) throw new Error(r.error)
-        const calls = parseToolCalls(r.reply)
         if (calls && calls.length) {
           const deltas = calls.map((c, i) => ({
             index: i, id: c.id, type: 'function',
@@ -423,7 +671,7 @@ async function handleChat(req, res, body) {
         }
       } else {
         r = await transport.chatStream(prompt, {
-          timeoutMs, newThread, files, chat, account, signal,
+          timeoutMs, newThread, files, chat, account, signal, flatten,
           onDelta: (full) => {
             const next = full.startsWith(emitted) ? full.slice(emitted.length) : full
             emitted = full
@@ -447,9 +695,10 @@ async function handleChat(req, res, body) {
     }
 
     // Non-streaming
-    const r = await transport.chat(prompt, { timeoutMs, newThread, files, chat, account, signal })
+    const { r, calls } = wantTools
+      ? await chatForTools(prompt, body, { timeoutMs, newThread, files, chat, account, signal, flatten })
+      : { r: await transport.chat(prompt, { timeoutMs, newThread, files, chat, account, signal, flatten }), calls: null }
     if (r.error && !r.reply) throw new Error(r.error)
-    const calls = wantTools ? parseToolCalls(r.reply) : null
 
     const message = calls && calls.length
       ? { role: 'assistant', content: null, tool_calls: calls }
@@ -593,7 +842,9 @@ export function startShim({ port = PORT, host = HOST, exitOnError = false } = {}
         const raw = await readBody(req)
         let body
         try { body = JSON.parse(raw || '{}') } catch { return sendError(res, 400, 'Invalid JSON body') }
-        return handleChat(req, res, body)
+        // awaited: a body that breaks the prompt build (`messages: [null]`) must end in the 500 below, not in an unhandled
+        // rejection that takes the whole shim — and every turn in flight — down
+        return await handleChat(req, res, body)
       }
 
       sendError(res, 404, `Unknown route: ${req.method} ${url}`, 'invalid_request_error')

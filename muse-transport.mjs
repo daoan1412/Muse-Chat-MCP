@@ -23,6 +23,7 @@ import { fileURLToPath } from 'node:url'
 import { accountCreds, loadDotEnv } from './muse-env.mjs'
 import { driver, MuseDriver, clearStaleSingleton } from './muse-driver.mjs'
 import { MuseNoiseClient, abortedError, isMuseSorry, museSorryError } from './muse-noise.mjs'
+import { flattenTransparent } from './muse-image.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PROFILE_DIR = process.env.MUSE_PROFILE_DIR || path.join(__dirname, 'accounts', 'acc1')
@@ -31,6 +32,9 @@ const CHANNEL = process.env.MUSE_CHANNEL || 'chrome'
 // MUSE_CHROME_PATH: launch this browser binary instead of the installed Chrome channel (e.g. Playwright's cached Chromium).
 const CHROME_PATH = process.env.MUSE_CHROME_PATH || ''
 const TRANSPORT = (process.env.MUSE_TRANSPORT || 'browser').toLowerCase()
+// transparent PNG / GIF / WebP attachments composited onto a plain background before upload (muse-image.mjs: Muse's
+// viewer draws transparency black). MUSE_FLATTEN_TRANSPARENT=0 turns it off for every request; `opts.flatten === false` for one.
+const FLATTEN = !['0', 'off', 'false', 'no'].includes(String(process.env.MUSE_FLATTEN_TRANSPARENT ?? '').trim().toLowerCase())
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const log = (...a) => console.error('[muse-transport]', ...a)
 
@@ -67,12 +71,18 @@ function historyMessages(json) {
 
 const MIME = {
   png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
+  svg: 'image/svg+xml', bmp: 'image/bmp', tif: 'image/tiff', tiff: 'image/tiff', avif: 'image/avif', heic: 'image/heic',
   mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm', pdf: 'application/pdf',
   txt: 'text/plain', md: 'text/markdown', csv: 'text/csv', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
 }
 const mimeFor = (name) => MIME[String(name).toLowerCase().split('.').pop()] || 'application/octet-stream'
 
-const extFor = (mime) => Object.keys(MIME).find((k) => MIME[k] === mime) || 'bin'
+// extension of a data: URL's media type — case and parameters ignored, the common non-standard image/jpg read as jpeg (a
+// KG question image of type image/svg+xml, image/jpg or IMAGE/PNG went up as attachment-<n>.bin, not as an image)
+const extFor = (mime) => {
+  const m = String(mime || '').split(';')[0].trim().toLowerCase()
+  return Object.keys(MIME).find((k) => MIME[k] === (m === 'image/jpg' ? 'image/jpeg' : m)) || 'bin'
+}
 
 // Read a local path, http(s)/data: URL, or the shim's { url } / { buffer, name, mimeType } file refs into bytes.
 // `n` (1-based position in the files list) names data: URLs `attachment-<n>.<ext>` so the numbering stays visible.
@@ -450,7 +460,14 @@ class NoiseTransport {
     for (const f of files) {
       for (let k = 0; ; k++) {
         if (signal && signal.aborted) throw abortedError()
-        try { out.push(await client.uploadAttachment(f.bytes, f.name, f.mime)); break }
+        try {
+          const up = await client.uploadAttachment(f.bytes, f.name, f.mime)
+          // the shim's prompt calls file n "attachment-<n>": a data: URL is named so already (readRef); a URL / path / named
+          // buffer keeps its own name, so its link gets that label as alt text — `![attachment-3](sandbox://…/deck.pdf)`
+          if (!new RegExp(`^attachment-${f.n}(\\.|$)`).test(String(f.name))) up.name = `attachment-${f.n}`
+          out.push(up)
+          break
+        }
         catch (e) {
           if (!clientLive(client) || k >= retries) {
             const err = new Error(`attachment ${f.n}/${files.length} upload failed: ${e.message}`)
@@ -481,6 +498,14 @@ class NoiseTransport {
         err.badInput = true
         throw err
       }
+    }
+    if (FLATTEN && opts.flatten !== false) {
+      const done = []
+      for (const f of files) {
+        const r = flattenTransparent(f.bytes, f.mime, f.name)
+        if (r.flattened) { Object.assign(f, { bytes: r.bytes, mime: r.mime, name: r.name }); done.push(`${f.n}:${r.background}`) }
+      }
+      if (done.length) log(`attachments: ${done.length}/${files.length} transparent image(s) flattened (${done.join(', ')})`)
     }
     let resumeSid = null // session of a turn whose connection dropped mid-reply: the next attempt picks it up, not a rerun
     let attachments = [], resumes = 0

@@ -230,6 +230,27 @@ Muse returned the correct color + digit for every image, mapped the numbering to
 and computed the cross-image sum from the **printed** digits (not the prompt numbers) — so
 multi-image + numbering + reasoning works on both transports.
 
+**Where each image belongs (noise).** Muse only sees an attachment once it opens the sandbox file with its own
+tool, and every file is linked at the end of the message. So the shim leaves a marker `[attachment-k]` in the
+prompt text exactly where an `image_url` / `file` part was (k = its place among the request's files = the
+`attachment-<k>` file name or link label), and ends the prompt with a short note asking Muse to open every
+attached file (with tools: the files the request needs, with its own viewer — not one of the caller's tools).
+Measured 28/10/2026 on question batches with images between the questions: without markers Muse shifted images
+onto the wrong question in 12/30 runs when a batch had no per-question image count or a failed download, 0/20
+with markers; on news-feed posts it answered without looking at the images in 13/62 runs, 3/62 with markers.
+Turn it off per request with header `x-muse-image-markers: off` (or body `muse_image_markers: false`), or for
+every request with `MUSE_SHIM_IMAGE_MARKERS=0`.
+
+**Transparent images (noise).** Muse's image viewer draws a transparent pixel as black, so a diagram with dark
+strokes on a transparent background reaches the model as a black square. Before upload the shim composites a PNG,
+GIF or still WebP that has transparent pixels onto white (black only when the visible content is light and almost
+none of it is dark) and sends it as an opaque `attachment-k.png`; anything else — JPEG, SVG, PDF, an opaque or
+animated image, a file that does not decode — goes as it is (`muse-image.mjs`; pure JS + libwebp in WebAssembly,
+no native module). Measured 28/10/2026: question images on transparency → "the image is black" in 13/18
+single-question runs, 0/6 on white; in 22 real multi-question review batches the "black image" complaints on such
+questions went from 3/45 to 0/45, other answers unchanged beyond run-to-run noise. Turn it off per request with
+header `x-muse-flatten: off` (or body `muse_flatten: false`), or for every request with `MUSE_FLATTEN_TRANSPARENT=0`.
+
 > Tip: to make numbering unambiguous, name the files `1.png`, `2.png`, … (the `alt` text becomes
 > the filename) or state the order explicitly in the prompt as above.
 
@@ -341,7 +362,7 @@ for chunk in r:
 - **Sessions** — target a chat with header `x-muse-chat: <title|index|url>` (or body `chat`); read chats via `GET /v1/muse/chats` and `GET /v1/muse/chat`.
 - **Multi-account (noise)** — set `MUSE_ACCOUNTS="acc1,acc2,acc3"` (bare ids → `./accounts/<id>`, or `id=path` for a custom dir); each account keeps its own Noise connection + quota. Route a request with header `x-muse-account: acc2` (or body `account`, or `?account=` on `/v1/muse/*`); default = first. `GET /health` lists every account's login/connection state. Seed a new account once with `muse_login` (`account` + email + mail password). With `*` in `MUSE_ACCOUNTS` the pool follows `MUSE_ACCOUNTS_DIR`: a new profile folder (creds in `.env`) joins within `MUSE_ACCOUNTS_RESCAN_SEC`, no restart. Browser transport stays single-account.
 - **Load balancing (noise)** — when a request does NOT name an account, `MUSE_ACCOUNT_LB` spreads it across the pool: `round_robin` (default when >1 account) alternates accounts, `least_conn` picks the one with fewest in-flight turns, `first`/`none` pins the default. An explicit `x-muse-account`/`account` always wins; if the chosen account fails (dead connection / rate-limited), the request fails over to the next. The non-stream response echoes the serving account in an `account` field.
-- **Headers** — `x-muse-thread: new` starts a fresh side chat (over `noise` this creates a real new thread with its own event feed; over `browser` it navigates to `/` first), `x-muse-timeout-ms`, `x-muse-account`.
+- **Headers** — `x-muse-thread: new` starts a fresh side chat (over `noise` this creates a real new thread with its own event feed; over `browser` it navigates to `/` first), `x-muse-timeout-ms`, `x-muse-account`, `x-muse-image-markers: off` (send the prompt without the `[attachment-k]` markers and the open-the-files note), `x-muse-flatten: off` (send transparent images as they are).
 
 ---
 
@@ -481,6 +502,8 @@ opencode, Cursor, Cline, Aider, … anything that can read files.
 | `MUSE_SHIM_HOST` | `127.0.0.1` | shim bind host |
 | `MUSE_SHIM_TIMEOUT_MS` | `240000` | default shim request timeout |
 | `MUSE_SHIM_MODELS` | `muse-spark-1.3,muse-spark-1.3-contributor,muse` | advertised model ids |
+| `MUSE_SHIM_IMAGE_MARKERS` | on over `noise`, off over `browser` | `[attachment-k]` where each attached part was + a note asking Muse to open the files; `0`/`off`/`false`/`no` = off for every request (header `x-muse-image-markers` still overrides) |
+| `MUSE_FLATTEN_TRANSPARENT` | on | (noise) transparent PNG / GIF / WebP attachments composited onto white before upload; `0`/`off`/`false`/`no` = off for every request (header `x-muse-flatten: off` turns it off for one) |
 | `MUSE_SHIM_API_KEY` | – | when set, `/v1/*` requires `Authorization: Bearer <key>` (or `x-api-key`); `/health` stays open |
 | `MUSE_ACCOUNTS` | – | multi-account (noise only): comma list of ids (bare `acc1,acc2` → `./accounts/<id>`) or `id=path`; each account = its own connection; route per request with `x-muse-account`. `*` = every Chrome profile folder (has `Default/`) under `MUSE_ACCOUNTS_DIR`, re-scanned while running — a new account joins without a restart (e.g. `acc1=./.muse-profile,*`) |
 | `MUSE_ACCOUNTS_RESCAN_SEC` | `30` | with `*`: how often (at most) a request re-scans `MUSE_ACCOUNTS_DIR`; new folders join, deleted ones leave; `.env` is re-read for their creds |
