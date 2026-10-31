@@ -71,7 +71,10 @@ See `README.md` for usage.
   again (`_relogin`, `MUSE_AUTO_RELOGIN=0` off): headless `MuseDriver.login` with its `.env` creds into a FRESH hidden
   profile `.<id>.relogin` (the old profile stalls on "Authentication is unavailable"), swapped in by two back-to-back
   `renameSync` (old kept as `.<id>.expired`); one sign-in at a time, failures back off `MUSE_RELOGIN_BACKOFF_MIN` (5)
-  doubling to `MUSE_RELOGIN_BACKOFF_MAX_MIN` (60). `/health` shows it as `signedOut`. Every cookie read is a Chromium
+  doubling to `MUSE_RELOGIN_BACKOFF_MAX_MIN` (60). `/health` shows it as `signedOut`. An account whose VM Meta disabled
+  (`/api/session` `vm_state: DISABLED`, wake 409, WS 502; muse.ai shows "Muse is disconnected … submit a feedback ticket")
+  fails `connect()` with `vmDisabled` and leaves the pool too (`_disable`, `/health` `vmDisabled`); its `/api/session` is
+  read again every `MUSE_VM_RECHECK_MIN` (30) and it comes back once the VM is not DISABLED. Every cookie read is a Chromium
   launch (logged `cookies: <id> read from its profile`), so only `_expire` drops an account's cookies: an LB failover
   just sets the cooldown, and `usage()` on a signed-out account fails at once instead of opening its profile. Reads
   (`list_chats`/`usage`/…) stay pinned to the default for determinism — LB applies to `chat`/`chatStream`.

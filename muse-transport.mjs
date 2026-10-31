@@ -198,6 +198,9 @@ class NoiseTransport {
     this.reloginBaseMs = Math.max(1, Number(process.env.MUSE_RELOGIN_BACKOFF_MIN ?? 5)) * 60000
     this.reloginMaxMs = Math.max(1, Number(process.env.MUSE_RELOGIN_BACKOFF_MAX_MIN ?? 60)) * 60000
     this._reloginQ = Promise.resolve()
+    // Meta-disconnected accounts (VM DISABLED, every connect 502s: 5,670 failovers in a week from one account, 28–31/10)
+    // leave the auto pool; their /api/session is read again every MUSE_VM_RECHECK_MIN (30) until the VM is back
+    this.vmRecheckMs = Math.max(1, Number(process.env.MUSE_VM_RECHECK_MIN ?? 30)) * 60000
     if (this.zombieMs) setInterval(() => { this._checkZombies().catch(() => {}) }, 15000).unref()
     if (this.quotaEveryMs) setInterval(() => { this._checkQuotas().catch(() => {}) }, this.quotaEveryMs).unref()
     entries.filter((e) => e !== '*').forEach((e, i) => {
@@ -287,6 +290,45 @@ class NoiseTransport {
     a.client = null; a.cookies = null
     this._scheduleRelogin(a, 0)
     return true
+  }
+  // A connect that found the account's VM DISABLED (Meta disconnected Muse for it): out of the auto pool until a re-read
+  // of /api/session says otherwise. A new sign-in does not help, the cookies stay.
+  _disable(a, e) {
+    if (!(e && e.vmDisabled)) return false
+    if (!a.vmDisabled) {
+      a.vmDisabled = { since: Date.now(), reason: String(e.message).slice(0, 200), checkedAt: Date.now(), nextAt: null }
+      log(`vm: ${a.id}: ${a.vmDisabled.reason} — out of the auto pool, re-checked every ${Math.round(this.vmRecheckMs / 60000)} min`)
+    }
+    this._scheduleVmCheck(a)
+    return true
+  }
+  _scheduleVmCheck(a) {
+    if (this.closing || !a.vmDisabled || a.vmTimer) return
+    a.vmDisabled.nextAt = Date.now() + this.vmRecheckMs
+    a.vmTimer = setTimeout(() => {
+      a.vmTimer = null
+      this._checkVm(a).catch((err) => log(`vm: ${a.id} re-check crashed: ${err.message}`))
+    }, this.vmRecheckMs)
+    a.vmTimer.unref()
+  }
+  async _checkVm(a) {
+    if (!a.vmDisabled || !this.accounts.has(a.id)) return
+    if (!a.expired) { // a signed-out account is read again once its sign-in brings new cookies
+      try {
+        const cookies = a.cookies || await this._grabCookies(a)
+        const { state } = await new MuseNoiseClient({ cookies, log }).vmState()
+        a.vmDisabled.checkedAt = Date.now()
+        if (state !== 'DISABLED') {
+          log(`vm: ${a.id} VM is ${state || 'not reported'} again — back in the auto pool`)
+          a.vmDisabled = null
+          return
+        }
+      } catch (e) {
+        a.vmDisabled.lastError = String(e.message).slice(0, 200)
+        this._expire(a, e)
+      }
+    }
+    this._scheduleVmCheck(a)
   }
   _scheduleRelogin(a, delayMs) {
     if (!this.autoRelogin || this.closing || !a.expired || a.reloginTimer || a.relogging) return
@@ -398,7 +440,7 @@ class NoiseTransport {
     this._rescan() // /health lists a just-seeded profile even while no turn is being routed
     const a = this._acct(opts.account)
     this._loadPaused()
-      const accounts = this.order.map((id) => { const x = this.accounts.get(id); return { id: x.id, email: x.creds.email || null, profileDir: x.profileDir, loggedIn: !!x.cookies, connected: !!(x.client && x.client.ws && x.client.ws.readyState === 1), inflight: x.inflight || 0, viewerId: x.viewerId, inPool: !this._depleted(x) && !this.paused.has(x.id) && !x.expired, paused: this.paused.has(x.id), signedOut: x.expired ? { ...x.expired, signingIn: !!x.relogging } : null, quota: x.quota, quotaError: x.quotaError } })
+      const accounts = this.order.map((id) => { const x = this.accounts.get(id); return { id: x.id, email: x.creds.email || null, profileDir: x.profileDir, loggedIn: !!x.cookies, connected: !!(x.client && x.client.ws && x.client.ws.readyState === 1), inflight: x.inflight || 0, viewerId: x.viewerId, inPool: !this._depleted(x) && !this.paused.has(x.id) && !x.expired && !x.vmDisabled, paused: this.paused.has(x.id), signedOut: x.expired ? { ...x.expired, signingIn: !!x.relogging } : null, vmDisabled: x.vmDisabled ? { ...x.vmDisabled } : null, quota: x.quota, quotaError: x.quotaError } })
     const connected = !!(a.client && a.client.ws && a.client.ws.readyState === 1)
     return {
       browserRunning: false, url: APP_URL, transport: 'noise',
@@ -607,7 +649,7 @@ class NoiseTransport {
     const settle = (r) => { a.inflight = Math.max(0, (a.inflight || 0) - 1); return r }
     // tag the error with the account that ran the turn, so the shim can report it like it does for a success
     // (and a turn that found the account signed out takes it out of the pool, pinned turns included)
-    const fail = (e) => { a.inflight = Math.max(0, (a.inflight || 0) - 1); if (e && typeof e === 'object' && !e.account) e.account = a.id; this._expire(a, e); throw e }
+    const fail = (e) => { a.inflight = Math.max(0, (a.inflight || 0) - 1); if (e && typeof e === 'object' && !e.account) e.account = a.id; this._expire(a, e); this._disable(a, e); throw e }
     const p = (opts.newSession || opts.newThread) ? this._run(a, prompt, opts) : this._serial(a, () => this._run(a, prompt, opts))
     return p.then(settle, fail)
   }
@@ -617,11 +659,11 @@ class NoiseTransport {
     this._rescan()
     const ranked = this._lbOrder()
     this._loadPaused()
-    const live = ranked.filter((a) => !this._depleted(a) && !this.paused.has(a.id) && !a.expired)
+    const live = ranked.filter((a) => !this._depleted(a) && !this.paused.has(a.id) && !a.expired && !a.vmDisabled)
     if (!live.length) {
-      const usable = ranked.filter((a) => !this.paused.has(a.id) && !a.expired)
+      const usable = ranked.filter((a) => !this.paused.has(a.id) && !a.expired && !a.vmDisabled)
       if (usable.length) throw quotaExhausted(usable)
-      const e = new Error(`every Muse account is paused or signed out (${ranked.map((a) => a.id).join(', ')})`)
+      const e = new Error(`every Muse account is paused, signed out or disconnected by Meta (${ranked.map((a) => a.id).join(', ')})`)
       e.quotaExhausted = true // same 503 as out of quota: callers move the work elsewhere
       throw e
     }
@@ -714,7 +756,7 @@ class NoiseTransport {
       }
       // `cands` was ranked when the request came in: an account found out of quota (or paused) since then is skipped, or
       // a failover lands on it — right after a restart every meter is unread, so a 429 wave sent ~60 turns onto DEPLETED ones
-      if (this._depleted(a) || this.paused.has(a.id) || a.expired) continue
+      if (this._depleted(a) || this.paused.has(a.id) || a.expired || a.vmDisabled) continue
       // meter still unreadable: let another account take the turn if there is one
       if (this.quotaEveryMs && !a.quota && a !== cands[cands.length - 1]) continue
       tried++

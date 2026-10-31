@@ -517,12 +517,20 @@ export class MuseNoiseClient {
     const vmId = sess.vm_id
     const endpoint = sess.endpoint_url
     if (!vmId || !endpoint) throw new Error('no vm assigned: ' + JSON.stringify(sess).slice(0, 200))
-    await this.rest('POST', '/api/hatch/vm/wake', { vm_id: vmId }).catch(() => {})
+    const woke = await this.rest('POST', '/api/hatch/vm/wake', { vm_id: vmId }).then(() => null, (e) => e)
+    // DISABLED = Meta switched Muse off for the account (muse.ai: "We disconnected Muse to protect your information. Submit
+    // a feedback ticket to reconnect"): wake answers 409 "VM wake unavailable" and the WS 502s, every try (31/10/2026)
+    if (sess.vm_state === 'DISABLED' && woke) throw vmDisabledError(vmId, woke.message)
     const tok = await this.rest('POST', '/api/hatch/token', { vmAddress: endpoint, vmName: vmId })
     if (!tok || !tok.token) throw new Error('no token: ' + JSON.stringify(tok).slice(0, 200))
     const url = `wss://${LB_HOST}${NOISE_PATH}?vm_id=${encodeURIComponent(vmId)}&auth_token=${encodeURIComponent(tok.token)}&notary_token=${encodeURIComponent(tok.notary_token || '')}&app_id=${APP_ID}&request_id=${crypto.randomUUID()}`
     this.log(`bootstrap ok vm=${vmId} host=${LB_HOST}`)
     return { url, vmId }
+  }
+  // The account's VM as /api/session reports it (plain HTTPS with the login cookies, no connection): RUNNING, DISABLED, …
+  async vmState() {
+    const sess = await this.rest('GET', '/api/session')
+    return { vmId: (sess && sess.vm_id) || null, state: (sess && sess.vm_state) || null }
   }
   async connect() {
     const { url } = await this.bootstrap()
@@ -1146,6 +1154,11 @@ export function abortedError() {
   const e = new Error('aborted: client disconnected')
   e.aborted = true
   e.noRetry = true
+  return e
+}
+export function vmDisabledError(vmId, detail) {
+  const e = new Error(`Muse disconnected by Meta (VM ${String(vmId).slice(0, 8)} DISABLED${detail ? `; ${String(detail).slice(0, 120)}` : ''}) — muse.ai asks for a feedback ticket to reconnect`)
+  e.vmDisabled = true
   return e
 }
 function sessionIdReused(opts) { return !!opts.sessionId }
