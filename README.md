@@ -499,12 +499,14 @@ opencode, Cursor, Cline, Aider, … anything that can read files.
 | `MUSE_STREAM_QUIET_MS` | `600` | streaming stability window (skip mid-message draft rewrites) |
 | `MUSE_LAUNCH_TIMEOUT_MS` | `60000` | launch / navigation timeout |
 | `MUSE_SHIM_PORT` | `8787` | shim port (`0` disables the shim) |
-| `MUSE_SHIM_HOST` | `127.0.0.1` | shim bind host |
+| `MUSE_SHIM_HOST` | `127.0.0.1` | shim bind host; `0.0.0.0` lets other machines call it, with an API key (see `MUSE_SHIM_KEYS_FILE`) |
 | `MUSE_SHIM_TIMEOUT_MS` | `240000` | default shim request timeout |
 | `MUSE_SHIM_MODELS` | `muse-spark-1.3,muse-spark-1.3-contributor,muse` | advertised model ids |
 | `MUSE_SHIM_IMAGE_MARKERS` | on over `noise`, off over `browser` | `[attachment-k]` where each attached part was + a note asking Muse to open the files; `0`/`off`/`false`/`no` = off for every request (header `x-muse-image-markers` still overrides) |
 | `MUSE_FLATTEN_TRANSPARENT` | on | (noise) transparent PNG / GIF / WebP attachments composited onto white before upload; `0`/`off`/`false`/`no` = off for every request (header `x-muse-flatten: off` turns it off for one) |
-| `MUSE_SHIM_API_KEY` | – | when set, `/v1/*` requires `Authorization: Bearer <key>` (or `x-api-key`); `/health` stays open |
+| `MUSE_SHIM_KEYS_FILE` | `<MUSE_ACCOUNTS_DIR>/.api-keys.json` | API keys for other machines (SHA-256 only; use counts in `.api-keys-usage.json`), re-read on change. Managed from this machine: `GET/POST /v1/muse/keys` (POST `{name, maxInflight?}` returns the key once), `POST /v1/muse/keys/<id>` `{name?, enabled?, maxInflight?}`, `DELETE /v1/muse/keys/<id>`. Another machine sends `Authorization: Bearer <key>` (or `x-api-key`) and may use only `/v1/models` + `/v1/chat/completions`; `/v1/muse/*` answers this machine only, `/health` tells it only `ok`. No key made = no other machine gets in |
+| `MUSE_SHIM_API_KEY` | – | one more key (id `env`) next to those in `MUSE_SHIM_KEYS_FILE` |
+| `MUSE_SHIM_AUTH_LOCAL` | – | `1` = callers on this machine need a key too (default: they need none) |
 | `MUSE_ACCOUNTS` | – | multi-account (noise only): comma list of ids (bare `acc1,acc2` → `./accounts/<id>`) or `id=path`; each account = its own connection; route per request with `x-muse-account`. `*` = every Chrome profile folder (has `Default/`) under `MUSE_ACCOUNTS_DIR`, re-scanned while running — a new account joins without a restart (e.g. `acc1=./.muse-profile,*`) |
 | `MUSE_ACCOUNTS_RESCAN_SEC` | `30` | with `*`: how often (at most) a request re-scans `MUSE_ACCOUNTS_DIR`; new folders join, deleted ones leave; `.env` is re-read for their creds |
 | `MUSE_ACCOUNT_COOLDOWN_SEC` | `60` | an account that failed a turn goes last in the LB order this long (cookies re-read after) |

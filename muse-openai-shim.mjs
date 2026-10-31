@@ -7,6 +7,12 @@
  *   GET  /v1/models              -> model list
  *   POST /v1/chat/completions    -> OpenAI chat completions (stream + non-stream)
  *   GET  /health                 -> browser/login state
+ *   GET|POST /v1/muse/keys[/<id>], DELETE /v1/muse/keys/<id> -> API keys (this machine only)
+ *
+ * Who may call: a request from this machine (127.0.0.1 / ::1) needs no key unless MUSE_SHIM_AUTH_LOCAL=1. One from
+ * any other machine (MUSE_SHIM_HOST=0.0.0.0) needs a key (`Authorization: Bearer <key>` or `x-api-key`) from
+ * muse-shim-keys.mjs, and may only use /v1/models + /v1/chat/completions: the /v1/muse/* routes (accounts' chats,
+ * usage, pausing, keys) answer this machine only. No key made = no other machine gets in.
  *
  * Why a shim: Muse has no OpenAI-compatible API (encrypted Noise WebSocket),
  * so we translate OpenAI requests into a prompt sent via muse-driver, then
@@ -29,9 +35,12 @@
  * ------------------------------------------------------------------
  */
 import http from 'node:http'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import Ajv from 'ajv'
 import addFormats from 'ajv-formats'
 import { transport } from './muse-transport.mjs'
+import { KeyStore } from './muse-shim-keys.mjs'
 
 const PORT = Number(process.env.MUSE_SHIM_PORT || 8787)
 const HOST = process.env.MUSE_SHIM_HOST || '127.0.0.1'
@@ -40,9 +49,13 @@ const MODEL_IDS = (process.env.MUSE_SHIM_MODELS || 'muse-spark-1.3,muse-spark-1.
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean)
-// Optional shared secret. When set, /v1/* requires `Authorization: Bearer <key>`
-// (or `x-api-key`). Empty (default) = no auth, as before.
-const API_KEY = process.env.MUSE_SHIM_API_KEY || ''
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const keys = new KeyStore({
+  file: process.env.MUSE_SHIM_KEYS_FILE || path.join(path.resolve(__dirname, process.env.MUSE_ACCOUNTS_DIR || 'accounts'), '.api-keys.json'),
+  envKey: process.env.MUSE_SHIM_API_KEY || '',
+})
+const AUTH_LOCAL = process.env.MUSE_SHIM_AUTH_LOCAL === '1'
+const LOCAL_ADDRS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
 
 const log = (...a) => console.error('[muse-shim]', ...a)
 const rid = () => `chatcmpl-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
@@ -541,13 +554,13 @@ function sendError(res, status, message, type = 'invalid_request_error', code = 
   res.end(body)
 }
 
-// Accept `Authorization: Bearer <key>` or `x-api-key`; no-op when API_KEY unset.
-function authOk(req) {
-  if (!API_KEY) return true
-  const auth = String(req.headers['authorization'] || '')
-  const bearer = auth.replace(/^Bearer\s+/i, '').trim()
-  const key = bearer || String(req.headers['x-api-key'] || '').trim()
-  return key === API_KEY
+const isLocal = (req) => LOCAL_ADDRS.has(req.socket.remoteAddress)
+
+// The key entry of `Authorization: Bearer <key>` / `x-api-key`, or null. Local callers often send a dummy key
+// ("muse-local"): that is fine, it is only checked when the caller has to have one.
+function keyOf(req) {
+  const bearer = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim()
+  return keys.check(bearer || String(req.headers['x-api-key'] || '').trim())
 }
 
 // Start an SSE response and return a writer that stops writing once the client
@@ -765,18 +778,27 @@ export function startShim({ port = PORT, host = HOST, exitOnError = false } = {}
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+        'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
         'Access-Control-Allow-Headers': '*',
       })
       return res.end()
     }
 
-    // Optional auth: /v1/* only; /health and / stay open for liveness probes.
-    if ((url === '/v1' || url.startsWith('/v1/')) && !authOk(req)) {
-      return sendError(res, 401, 'Invalid or missing API key (send Authorization: Bearer <MUSE_SHIM_API_KEY>)', 'authentication_error', 'invalid_api_key')
+    // /v1/*: a caller on this machine passes (unless MUSE_SHIM_AUTH_LOCAL=1), any other needs a key and may not use the
+    // /v1/muse/* routes. /health stays open for liveness probes, but tells another machine only `ok` without a key.
+    const local = isLocal(req) && !AUTH_LOCAL
+    const key = keyOf(req)
+    if ((url === '/v1' || url.startsWith('/v1/')) && !local) {
+      if (!key) return sendError(res, 401, 'Invalid or missing API key (send Authorization: Bearer <key>)', 'authentication_error', 'invalid_api_key')
+      if (url.startsWith('/v1/muse/') && !isLocal(req)) return sendError(res, 403, `${url} answers only the machine the shim runs on`, 'permission_error')
     }
 
     try {
+      if (req.method === 'GET' && (url === '/health' || url === '/') && !local && !key) {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+        return res.end(JSON.stringify({ ok: true }))
+      }
+
       if (req.method === 'GET' && (url === '/health' || url === '/')) {
         let st = { browserRunning: false, loggedIn: false }
         try { st = await transport.status() } catch {}
@@ -838,7 +860,32 @@ export function startShim({ port = PORT, host = HOST, exitOnError = false } = {}
         return res.end(JSON.stringify(data))
       }
 
+      // API keys for other machines: list (no secrets), make (secret returned once), change {name, enabled, maxInflight},
+      // delete. Body of make: {name, maxInflight?, createdBy?}.
+      if (url === '/v1/muse/keys' || url.startsWith('/v1/muse/keys/')) {
+        const id = decodeURIComponent(url.slice('/v1/muse/keys/'.length))
+        let body = {}
+        if (req.method === 'POST') {
+          try { body = JSON.parse((await readBody(req)) || '{}') } catch { return sendError(res, 400, 'Invalid JSON body') }
+        }
+        let data
+        try {
+          if (req.method === 'GET' && url === '/v1/muse/keys') data = { keys: keys.list(), host: HOST, port: PORT, authLocal: AUTH_LOCAL }
+          else if (req.method === 'POST' && url === '/v1/muse/keys') data = keys.create(body)
+          else if (req.method === 'POST' && id) data = keys.update(id, body)
+          else if (req.method === 'DELETE' && id) data = keys.remove(id)
+          else return sendError(res, 404, `Unknown route: ${req.method} ${url}`, 'invalid_request_error')
+        } catch (e) { return sendError(res, 404, e.message, 'invalid_request_error', null, 'id') }
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+        return res.end(JSON.stringify(data))
+      }
+
       if (req.method === 'POST' && url === '/v1/chat/completions') {
+        if (key) {
+          const end = keys.begin(key, req.socket.remoteAddress)
+          if (!end) return sendError(res, 429, `key "${key.name}" already has ${key.maxInflight} turns running (its limit)`, 'rate_limit_error', 'key_inflight_limit')
+          res.on('close', () => end(res.statusCode))
+        }
         const raw = await readBody(req)
         let body
         try { body = JSON.parse(raw || '{}') } catch { return sendError(res, 400, 'Invalid JSON body') }
@@ -861,7 +908,7 @@ export function startShim({ port = PORT, host = HOST, exitOnError = false } = {}
     if (exitOnError) { console.error(`[muse-shim] cannot start on ${host}:${port}: ${err && err.message}`); process.exit(1) }
   })
   server.listen(port, host, () => {
-    log(`OpenAI shim listening on http://${host}:${port}/v1  (models: ${MODEL_IDS.join(', ')})${API_KEY ? '  [auth on]' : ''}`)
+    log(`OpenAI shim listening on http://${host}:${port}/v1  (models: ${MODEL_IDS.join(', ')})  [keys: ${keys.list().length}${AUTH_LOCAL ? ', local too' : ', this machine needs none'}]`)
   })
   return server
 }
