@@ -37,7 +37,7 @@ const APP_ID = 'hatch-web'
 // redeploy changes it (24/10/2026 01:07 UTC 4029ac5c… → 40034617…, every meter read then got 404 "Server action not
 // found" and the pool kept stale quotas) → usage() finds the new id in the app's JS (refreshSubscriptionAction).
 // MUSE_SUBSCRIPTION_ACTION_ID sets the id to start from.
-let subscriptionActionId = process.env.MUSE_SUBSCRIPTION_ACTION_ID || '409b972cbb33d3e372f4ca9d3c8332677217064f62' // 27/10
+let subscriptionActionId = process.env.MUSE_SUBSCRIPTION_ACTION_ID || '406cd44441421b58cea8309747129141947de9f499' // 24/11
 export const subscriptionAction = () => subscriptionActionId
 const PROTONAME = 'Noise_XX_25519_AESGCM_SHA256'
 const CHUNK_MAX = 65489
@@ -402,7 +402,8 @@ function wreqWs(sock) {
 }
 // The client bundle declares each action as createServerReference("<id>", x.callServer, void 0, x.findSourceMapURL, "<name>").
 const ACTION_RE = /"([0-9a-f]{40,})"\s*,[^"]{0,160}?"fetchSubscriptionAction"/
-const CHUNK_RE = /static\/chunks\/[\w.\-/]+?\.js/g
+// 24/11/2026 ~19:40 UTC Muse moved its chunks to static/immutable/chunks/ — the old pattern then matched none ("0 chunks")
+const CHUNK_RE = /static\/(?:immutable\/)?chunks\/[\w.\-/]+?\.js/g
 const ACTION_REFRESH_MS = 10 * 60e3
 let actionRefresh = null
 let actionRefreshAt = 0
